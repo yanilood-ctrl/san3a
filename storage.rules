@@ -1,0 +1,222 @@
+rules_version = '2';
+
+// Phase 6B2: replaces the "temporary development / QA" rules with
+// path-specific, ownership-provable rules. New uploads use uid-scoped
+// paths (chat: sender/receiver uid; orders: customer uid) so authorization
+// never depends on parsing an id string. Objects written before this phase
+// keep working under separate, narrower "legacy path" match blocks below.
+
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    // ── Helpers ────────────────────────────────────────────────────────────
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function registeredUser(uid) {
+      return firestore.exists(/databases/(default)/documents/users/$(uid));
+    }
+
+    function roleOf(uid) {
+      return firestore.get(/databases/(default)/documents/users/$(uid)).data.role;
+    }
+
+    function storedRole() {
+      return roleOf(request.auth.uid);
+    }
+
+    function isAdmin() {
+      return isSignedIn() && storedRole() == 'admin';
+    }
+
+    function isNewObject() {
+      return resource == null;
+    }
+
+    // Requires two distinct, real registered users forming a real
+    // customer <-> professional/contractor pair, with neither side being
+    // an admin — narrows arbitrary-folder spam to real customer/provider
+    // pairs without ever parsing an id string.
+    function validChatRolePair(senderRole, receiverRole) {
+      return senderRole != 'admin'
+        && receiverRole != 'admin'
+        && (
+          (senderRole == 'customer'
+            && (receiverRole == 'professional' || receiverRole == 'contractor'))
+          || (receiverRole == 'customer'
+            && (senderRole == 'professional' || senderRole == 'contractor'))
+        );
+    }
+
+    function validChatPair(senderUid, receiverUid) {
+      return senderUid != receiverUid
+        && registeredUser(senderUid)
+        && registeredUser(receiverUid)
+        && validChatRolePair(roleOf(senderUid), roleOf(receiverUid));
+    }
+
+    function orderExists(orderId) {
+      return firestore.exists(/databases/(default)/documents/orders/$(orderId));
+    }
+
+    function isOrderCustomer(orderId) {
+      return request.auth.uid
+        == firestore.get(/databases/(default)/documents/orders/$(orderId)).data.customerId;
+    }
+
+    function isOrderParticipant(orderId) {
+      let order = firestore.get(/databases/(default)/documents/orders/$(orderId)).data;
+      return request.auth.uid == order.customerId || request.auth.uid == order.providerId;
+    }
+
+    function conversationExists(conversationId) {
+      return firestore.exists(/databases/(default)/documents/conversations/$(conversationId));
+    }
+
+    function isConversationParticipant(conversationId) {
+      return request.auth.uid in
+        firestore.get(/databases/(default)/documents/conversations/$(conversationId)).data.participantIds;
+    }
+
+    function validProfileImage() {
+      return request.resource.size < 5 * 1024 * 1024
+        && request.resource.contentType in ['image/jpeg', 'image/png', 'image/webp'];
+    }
+
+    function validChatImage() {
+      return request.resource.size < 10 * 1024 * 1024
+        && request.resource.contentType in
+          ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+    }
+
+    function validVoice() {
+      return request.resource.size < 25 * 1024 * 1024
+        && request.resource.contentType in ['audio/mp4', 'audio/webm'];
+    }
+
+    function validOrderImage() {
+      return request.resource.size < 5 * 1024 * 1024
+        && request.resource.contentType == 'image/jpeg';
+    }
+
+    // ── Profile images ───────────────────────────────────────────────────────
+    match /profile_images/{userId}/{fileName} {
+      allow read: if isSignedIn();
+
+      allow create: if isSignedIn()
+        && request.auth.uid == userId
+        && isNewObject()
+        && validProfileImage();
+
+      allow update: if false;
+
+      allow delete: if isSignedIn() && request.auth.uid == userId;
+    }
+
+    // ── New chat images: chat_images/{senderUid}/{receiverUid}/{messageId}/{fileName} ──
+    match /chat_images/{senderUid}/{receiverUid}/{messageId}/{fileName} {
+      allow read: if isSignedIn()
+        && (request.auth.uid == senderUid
+          || request.auth.uid == receiverUid
+          || isAdmin());
+
+      allow create: if isSignedIn()
+        && request.auth.uid == senderUid
+        && validChatPair(senderUid, receiverUid)
+        && isNewObject()
+        && validChatImage();
+
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    // ── New chat voice: chat_voice/{senderUid}/{receiverUid}/{messageId}/{fileName} ──
+    match /chat_voice/{senderUid}/{receiverUid}/{messageId}/{fileName} {
+      allow read: if isSignedIn()
+        && (request.auth.uid == senderUid
+          || request.auth.uid == receiverUid
+          || isAdmin());
+
+      allow create: if isSignedIn()
+        && request.auth.uid == senderUid
+        && validChatPair(senderUid, receiverUid)
+        && isNewObject()
+        && validVoice();
+
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    // ── Legacy chat images: chat_images/{conversationId}/{fileName} ──────────
+    // Distinct segment count from the new 4-segment path above -- no overlap.
+    // No sender is provable from this path shape, so read is participant/Admin
+    // scoped (not sender scoped), and only once the conversation doc exists.
+    match /chat_images/{conversationId}/{fileName} {
+      allow read: if isSignedIn()
+        && conversationExists(conversationId)
+        && (isConversationParticipant(conversationId) || isAdmin());
+
+      allow create: if false;
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    // ── Legacy chat voice: chat_voice/{conversationId}/{fileName} ────────────
+    match /chat_voice/{conversationId}/{fileName} {
+      allow read: if isSignedIn()
+        && conversationExists(conversationId)
+        && (isConversationParticipant(conversationId) || isAdmin());
+
+      allow create: if false;
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    // ── New order images: orders/{customerUid}/{orderId}/images/{fileName} ──
+    // The order document does not exist yet at upload time (the client
+    // uploads before creating orders/{orderId}) -- the owner-uid path segment
+    // is what proves upload/read/delete ownership before that point.
+    match /orders/{customerUid}/{orderId}/images/{fileName} {
+      allow read: if isSignedIn()
+        && (request.auth.uid == customerUid
+          || (orderExists(orderId) && isOrderParticipant(orderId))
+          || isAdmin());
+
+      allow create: if isSignedIn()
+        && request.auth.uid == customerUid
+        && isNewObject()
+        && validOrderImage();
+
+      allow update: if false;
+
+      allow delete: if isSignedIn()
+        && (request.auth.uid == customerUid
+          || (orderExists(orderId) && isOrderCustomer(orderId))
+          || isAdmin());
+    }
+
+    // ── Legacy order images: orders/{orderId}/images/{fileName} ──────────────
+    // No customerUid segment exists on this shape -- ownership can only be
+    // proven once the order document exists, so unlike the new path above,
+    // every branch here (including Admin) requires orderExists() first.
+    match /orders/{orderId}/images/{fileName} {
+      allow read: if isSignedIn()
+        && orderExists(orderId)
+        && (isOrderParticipant(orderId) || isAdmin());
+
+      allow create: if false;
+      allow update: if false;
+
+      allow delete: if isSignedIn()
+        && orderExists(orderId)
+        && (isOrderCustomer(orderId) || isAdmin());
+    }
+
+    // ── Default deny ─────────────────────────────────────────────────────────
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

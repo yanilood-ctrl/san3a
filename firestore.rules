@@ -1,0 +1,2202 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return request.auth != null
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    // Fields a non-admin user may change on their own users/{uid} document.
+    // Proven from AuthNotifier.updateCustomerProfile / updateProfessionalProfile /
+    // updateContractorProfile / saveServicesList / saveSpecialties /
+    // uploadProfilePhoto / removeProfilePhoto / markCustomerOrdersSeenInFirestore
+    // (lib/features/auth/presentation/providers/app_providers.dart).
+    function selfEditableUserFields(role) {
+      return role == 'customer'
+        ? ['fullName', 'email', 'phone', 'city', 'streetNumber',
+           'languages', 'preferredContactHours', 'favoriteServices',
+           'avatar', 'ordersLastSeenAt']
+        : role == 'contractor'
+          ? ['fullName', 'email', 'phone', 'workArea', 'city', 'companyName',
+             'experienceYears', 'serviceDescription', 'languages',
+             'workingDays', 'workStartTime', 'workEndTime',
+             'avatar', 'servicesList', 'specialties', 'specialty']
+          : ['fullName', 'email', 'phone', 'workArea', 'city',
+             'experienceYears', 'serviceDescription', 'languages',
+             'workingDays', 'workStartTime', 'workEndTime',
+             'avatar', 'servicesList', 'specialties', 'specialty'];
+    }
+
+    match /users/{userId} {
+      allow read: if true;
+
+      // المستخدم يستطيع إنشاء وثيقته الخاصة فقط، بدور غير مميز
+      // (customer/professional/contractor) وبدون قيم مميزة عند الإنشاء
+      // (admin role, isBlocked, isDeleted, suspendedUntil, warnings, rating, totalJobs)
+      allow create: if request.auth != null
+        && request.auth.uid == userId
+        && request.resource.data.id == userId
+        && request.resource.data.id == request.auth.uid
+        && request.resource.data.role in ['customer', 'professional', 'contractor']
+        && (!('isBlocked' in request.resource.data) || request.resource.data.isBlocked == false)
+        && (!('isDeleted' in request.resource.data) || request.resource.data.isDeleted == false)
+        && (!('suspendedUntil' in request.resource.data) || request.resource.data.suspendedUntil == null)
+        && (!('warnings' in request.resource.data) || request.resource.data.warnings.size() == 0)
+        && (!('rating' in request.resource.data) || request.resource.data.rating == 0)
+        && (!('totalJobs' in request.resource.data) || request.resource.data.totalJobs == 0);
+
+      // المستخدم يستطيع تعديل بروفايله فقط ضمن الحقول المسموحة لدوره، بدون تغيير الدور،
+      // والأدمن يستطيع تعديل بيانات المستخدمين خلال مرحلة QA (بدون تغيير الدور)
+      allow update: if request.auth != null
+        && request.resource.data.role == resource.data.role
+        && (
+          (
+            request.auth.uid == userId
+            && request.resource.data.diff(resource.data).affectedKeys()
+              .hasOnly(selfEditableUserFields(resource.data.role))
+          )
+          || isAdmin()
+        );
+
+      allow delete: if false;
+    }
+
+    match /categories/{categoryId} {
+      allow read: if true;
+      allow create, update, delete: if isAdmin();
+    }
+
+    function requesterRoleMatchesAccount(role) {
+      return exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == role;
+    }
+
+    match /category_requests/{requestId} {
+      // صاحب الطلب يستطيع قراءة طلبه فقط، والأدمن يستطيع قراءة كل الطلبات
+      allow read: if request.auth != null
+        && (
+          resource.data.requesterId == request.auth.uid
+          || isAdmin()
+        );
+
+      // Customer/Professional/Contractor الموقّع يستطيع إنشاء طلب تصنيف خاص به فقط،
+      // بدور مطابق لدوره الحقيقي المخزّن في وثيقته، وبحالة pending فقط،
+      // وبدون قيم مميزة في حقول مراجعة الأدمن عند الإنشاء
+      allow create: if request.auth != null
+        && request.resource.data.requesterId == request.auth.uid
+        && request.resource.data.requesterRole in ['customer', 'professional', 'contractor']
+        && requesterRoleMatchesAccount(request.resource.data.requesterRole)
+        && request.resource.data.status == 'pending'
+        && (!('reviewedAt' in request.resource.data) || request.resource.data.reviewedAt == null)
+        && (!('reviewedBy' in request.resource.data) || request.resource.data.reviewedBy == null)
+        && (!('adminNote' in request.resource.data) || request.resource.data.adminNote == null);
+
+      // صاحب الطلب يستطيع تعديل الاسم/الوصف فقط وطالما الطلب لا يزال Pending،
+      // والأدمن يستطيع اعتماد أو رفض طلب Pending فقط،
+      // مع بقاء هوية الطلب (requesterId/requesterRole/createdAt) دون تغيير في الحالتين
+      allow update: if request.auth != null
+        && request.resource.data.requesterId == resource.data.requesterId
+        && request.resource.data.requesterRole == resource.data.requesterRole
+        && request.resource.data.createdAt == resource.data.createdAt
+        && (
+          (
+            resource.data.requesterId == request.auth.uid
+            && resource.data.status == 'pending'
+            && request.resource.data.status == 'pending'
+            && request.resource.data.diff(resource.data).affectedKeys()
+              .hasOnly(['requestedName', 'requestedDescription'])
+          )
+          || (
+            isAdmin()
+            && resource.data.status == 'pending'
+            && request.resource.data.status in ['approved', 'rejected']
+            && request.resource.data.diff(resource.data).affectedKeys()
+              .hasOnly(['status', 'reviewedAt', 'reviewedBy'])
+          )
+        );
+
+      // المستخدم يستطيع حذف طلب التصنيف الخاص به فقط
+      // وفقط إذا كانت حالة الطلب Pending
+      allow delete: if isSignedIn()
+        && resource.data.requesterId == request.auth.uid
+        && resource.data.status == 'pending';
+    }
+
+    // Chat / Quick Replies — Phase 4C1 hardening. Real code paths proven in
+    // lib/features/auth/presentation/providers/app_providers.dart
+    // (quickRepliesProvider / adminQuickRepliesProvider /
+    // createQuickReplyInFirestore / updateQuickReplyInFirestore /
+    // deleteQuickReplyInFirestore) and lib/features/admin/presentation/
+    // screens/admin_chat_screen.dart (_QuickRepliesTab — the only real
+    // create/edit/toggle-active UI). Customer/Professional/Contractor chat
+    // screens (customer_chat_screen.dart, professional_chat_screen.dart,
+    // contractor_chat_screen.dart) only ever read via quickRepliesProvider,
+    // which fetches the whole collection with no query filter and applies
+    // isActive/visibleToRole(myRole) filtering entirely client-side after
+    // the read — Firestore Rules are not a filter, so read must stay open
+    // to every signed-in user regardless of role; quick replies are global,
+    // not user-owned.
+    match /quick_replies/{replyId} {
+      // القراءة: أي مستخدم موقّع (كل الأدوار) — quickRepliesProvider
+      // (Customer/Professional/Contractor) وadminQuickRepliesProvider
+      // (الأدمن) يقرآن المجموعة كاملة دون أي فلتر من جهة Firestore؛ التصفية
+      // حسب isActive/role تتم بالكامل من جانب العميل بعد القراءة.
+      allow read: if request.auth != null;
+
+      // الإنشاء: الأدمن فقط (createQuickReplyInFirestore — لا يوجد مسار
+      // إنشاء حقيقي من أي شاشة Customer/Professional/Contractor)، بمعرف
+      // وثيقة مطابق، وisActive:true دائمًا عند الإنشاء الحقيقي، وcreatedBy
+      // إن وُجد يجب أن يطابق الأدمن الفاعل نفسه (المسار الحقيقي الوحيد يمرر
+      // ref.read(authProvider)?.id الخاص بالأدمن نفسه).
+      allow create: if isAdmin()
+        && request.resource.data.get('id', replyId) == replyId
+        && request.resource.data.text is string
+        && request.resource.data.text.size() > 0
+        && request.resource.data.roles is list
+        && request.resource.data.isActive == true
+        && request.resource.data.createdAt is string
+        && request.resource.data.updatedAt is string
+        && (!('createdBy' in request.resource.data)
+          || request.resource.data.createdBy == request.auth.uid)
+        && request.resource.data.keys().hasOnly([
+          'id', 'text', 'roles', 'isActive', 'createdAt', 'updatedAt', 'createdBy'
+        ]);
+
+      // التعديل: الأدمن فقط — تعديل النص (updateQuickReplyInFirestore) أو
+      // تبديل isActive (تفعيل/تعطيل ناعم عبر updateQuickReplyInFirestore/
+      // deleteQuickReplyInFirestore) فقط، مع بقاء هوية الوثيقة
+      // (id/createdAt/createdBy) ثابتة دائمًا. roles ليست ضمن أي مسار
+      // تعديل حقيقي حاليًا لكنها مسموحة نوعًا (list) للتوافق مع توقيع
+      // الدالة الحقيقي الذي يقبلها.
+      allow update: if isAdmin()
+        && request.resource.data.get('id', replyId) == replyId
+        && request.resource.data.get('createdAt', null)
+          == resource.data.get('createdAt', null)
+        && request.resource.data.get('createdBy', null)
+          == resource.data.get('createdBy', null)
+        && (!('text' in request.resource.data) || request.resource.data.text is string)
+        && (!('roles' in request.resource.data) || request.resource.data.roles is list)
+        && (!('isActive' in request.resource.data) || request.resource.data.isActive is bool)
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['text', 'roles', 'isActive', 'updatedAt']);
+
+      // لا يوجد مسار حذف فعلي — التعطيل يتم دائمًا عبر isActive:false
+      // (soft delete)، وليس حذف الوثيقة.
+      allow delete: if false;
+    }
+
+    // Chat Reports — Phase 4C2 hardening, extended in Phase 8 for the
+    // requester-initiated "Delete Request" action. Real code paths proven in
+    // lib/features/auth/presentation/providers/app_providers.dart
+    // (adminChatReportsProvider / myChatReportsProvider /
+    // createChatReportInFirestore / updateChatReportStatusInFirestore /
+    // updateChatReportRequestFieldsInFirestore / markChatReportsSeenByAdmin),
+    // lib/features/customer/presentation/screens/customer_messages_screen.dart
+    // (_AdminChatRequestSheetState — the only real "Request Admin Help"
+    // create flow, always writes reason from a fixed 4-item list and never
+    // sets messageId), lib/shared/screens/my_chat_requests_screen.dart and
+    // lib/features/customer/presentation/screens/customer_chat_requests_screen.dart
+    // (_EditRequestSheetState — the only real requester-edit flow, gated in
+    // the real UI to status == 'open' and using the identical 4-item reason
+    // list; and the "Delete Request" action — calls the same
+    // updateChatReportStatusInFirestore the Admin flow uses, gated in the UI
+    // to status == 'open', to self-transition status straight to 'rejected'
+    // with no other field changes), and
+    // lib/features/admin/presentation/screens/admin_chat_screen.dart
+    // (_ReportDetailSheet — the only real Admin status/note update UI,
+    // offering only in_review/resolved/rejected as new-status targets, never
+    // 'open'; and the unseen-badge mark-seen flow). ChatReportModel
+    // (lib/shared/models/models.dart).
+    match /chat_reports/{reportId} {
+      // الحقول التي لا يغيّرها أي مسار تحديث حقيقي — يجب أن تبقى ثابتة عبر كل
+      // فروع allow update أدناه (تعديل صاحب البلاغ، أو حالة/ملاحظة الأدمن،
+      // أو تعليم "شوهد من الأدمن").
+      function reportIdentityUnchanged() {
+        return request.resource.data.get('id', reportId) == reportId
+          && request.resource.data.conversationId == resource.data.conversationId
+          && request.resource.data.reporterId == resource.data.reporterId
+          && request.resource.data.reporterName == resource.data.reporterName
+          && request.resource.data.reporterRole == resource.data.reporterRole
+          && request.resource.data.get('reportedUserId', null)
+            == resource.data.get('reportedUserId', null)
+          && request.resource.data.get('reportedUserName', null)
+            == resource.data.get('reportedUserName', null)
+          && request.resource.data.get('reportedUserRole', null)
+            == resource.data.get('reportedUserRole', null)
+          && request.resource.data.get('messageId', null)
+            == resource.data.get('messageId', null)
+          && request.resource.data.priority == resource.data.priority
+          && request.resource.data.get('createdAt', null)
+            == resource.data.get('createdAt', null);
+      }
+
+      // الإنشاء: عميل/مزوّد موقّع فقط (لا مسار إنشاء حقيقي للأدمن)، بمعرف
+      // مبلِّغ مطابق لحسابه الحقيقي ودور مطابق للدور المخزّن فعليًا، ولمحادثة
+      // موجودة فعلًا يكون المبلِّغ أحد طرفيها — ومع أي طرف/رسالة مُبلَّغ
+      // عنهما (إن وُجدا) ينتميان لنفس تلك المحادثة تحديدًا. reason مقيّد
+      // بنفس القائمة الثابتة المستخدمة في شاشتي الإنشاء والتعديل الحقيقيتين
+      // معًا. لا حقول إشراف مميّزة عند الإنشاء (adminNote غائب، isSeenByAdmin
+      // false دائمًا).
+      function reportCreateValid() {
+        return request.resource.data.id == reportId
+          && request.resource.data.reporterId == request.auth.uid
+          && request.resource.data.reporterRole
+            in ['customer', 'professional', 'contractor']
+          && request.resource.data.conversationId is string
+          && exists(/databases/$(database)/documents/conversations/$(request.resource.data.conversationId))
+          && request.auth.uid in get(/databases/$(database)/documents/conversations/$(request.resource.data.conversationId)).data.participantIds
+          && (!('reportedUserId' in request.resource.data)
+            || (
+              request.resource.data.reportedUserId != request.resource.data.reporterId
+              && request.resource.data.reportedUserId
+                in get(/databases/$(database)/documents/conversations/$(request.resource.data.conversationId)).data.participantIds
+            ))
+          && (!('messageId' in request.resource.data)
+            || exists(/databases/$(database)/documents/conversations/$(request.resource.data.conversationId)/messages/$(request.resource.data.messageId)))
+          && request.resource.data.reason in [
+            'Edit a Message', 'Delete a Message', 'Inappropriate Messages', 'Other Issue'
+          ]
+          && request.resource.data.status == 'open'
+          && request.resource.data.priority == 'medium'
+          && request.resource.data.isSeenByAdmin == false
+          && !('adminNote' in request.resource.data)
+          && request.resource.data.reporterName is string
+          && request.resource.data.createdAt is string
+          && request.resource.data.updatedAt is string
+          && request.resource.data.keys().hasOnly([
+            'id', 'conversationId', 'reporterId', 'reporterName', 'reporterRole',
+            'reportedUserId', 'reportedUserName', 'reportedUserRole', 'messageId',
+            'reason', 'description', 'status', 'priority', 'createdAt', 'updatedAt',
+            'isSeenByAdmin'
+          ]);
+      }
+
+      // آ. صاحب البلاغ يعدّل reason/description فقط، وفقط طالما الحالة لا
+      // تزال 'open' (updateChatReportRequestFieldsInFirestore — الشرط الحقيقي
+      // مطبَّق في الشاشة فقط، لذا يُعاد تطبيقه هنا صراحة).
+      function requesterEditBranch(keys) {
+        return resource.data.reporterId == request.auth.uid
+          && resource.data.status == 'open'
+          && request.resource.data.reason in [
+            'Edit a Message', 'Delete a Message', 'Inappropriate Messages', 'Other Issue'
+          ]
+          && (!('description' in request.resource.data)
+            || request.resource.data.description is string)
+          && keys.hasOnly(['reason', 'description', 'updatedAt']);
+      }
+
+      // ب. الأدمن يغيّر الحالة إلى إحدى in_review/resolved/rejected فقط (لا
+      // زر حقيقي للعودة إلى 'open')، أو يحفظ نفس الحالة مع ملاحظة أدمن فقط
+      // (_saveNote الحقيقي).
+      function adminStatusBranch(keys) {
+        return isAdmin()
+          && (
+            request.resource.data.status == resource.data.status
+            || request.resource.data.status in ['in_review', 'resolved', 'rejected']
+          )
+          && (!('adminNote' in request.resource.data)
+            || request.resource.data.adminNote is string)
+          && keys.hasOnly(['status', 'updatedAt', 'adminNote']);
+      }
+
+      // د. صاحب البلاغ "يحذف" طلبه (Delete Request في واجهة My Chat
+      // Requests) — هذا ليس حذفًا فعليًا للوثيقة، بل انتقال ذاتي للحالة من
+      // 'open' إلى 'rejected' فقط، دون تغيير أي حقل آخر سوى updatedAt. لا
+      // يسمح بأي انتقال حالة آخر (لا يمكن الانتقال من in_review/resolved،
+      // ولا الانتقال إلى أي حالة غير rejected) — فقط الأدمن يملك صلاحية بقية
+      // انتقالات الحالة عبر adminStatusBranch أعلاه.
+      function requesterSelfRejectBranch(keys) {
+        return resource.data.reporterId == request.auth.uid
+          && resource.data.status == 'open'
+          && request.resource.data.status == 'rejected'
+          && keys.hasOnly(['status', 'updatedAt']);
+      }
+
+      // ه. الأدمن يعلّم البلاغ كمشاهَد فقط (markChatReportsSeenByAdmin).
+      function adminMarkSeenBranch(keys) {
+        return isAdmin()
+          && request.resource.data.isSeenByAdmin == true
+          && keys.hasOnly(['isSeenByAdmin']);
+      }
+
+      function reportUpdateAllowed(keys) {
+        return requesterEditBranch(keys)
+          || requesterSelfRejectBranch(keys)
+          || adminStatusBranch(keys)
+          || adminMarkSeenBranch(keys);
+      }
+
+      // القراءة: صاحب البلاغ لبلاغاته الخاصة فقط (myChatReportsProvider —
+      // where('reporterId', isEqualTo: uid) حقيقي)، أو الأدمن لكل البلاغات
+      // دون فلترة (adminChatReportsProvider).
+      allow read: if request.auth != null
+        && (resource.data.reporterId == request.auth.uid || isAdmin());
+
+      allow create: if request.auth != null
+        && requesterRoleMatchesAccount(request.resource.data.reporterRole)
+        && reportCreateValid();
+
+      allow update: if request.auth != null
+        && reportIdentityUnchanged()
+        && reportUpdateAllowed(request.resource.data.diff(resource.data).affectedKeys());
+
+      // لا يوجد مسار حذف فعلي للبلاغات في التطبيق.
+      allow delete: if false;
+    }
+
+    // Phase 3A hardening. Real code paths proven in
+    // lib/features/auth/presentation/providers/app_providers.dart
+    // (ContractorWorkersService, contractorWorkersStreamProvider,
+    // contractorWorkersByIdProvider), lib/shared/models/models.dart
+    // (WorkerModel), lib/features/contractor/presentation/screens/
+    // contractor_suppliers_screen.dart (real Add/Edit/Delete Worker form),
+    // lib/features/admin/presentation/screens/admin_users_screen.dart
+    // (_AdminEditWorkerDialog / ContractorWorkersService.updateFields), and
+    // lib/features/customer/presentation/screens/provider_profile_screen.dart
+    // (public provider-profile worker roster, read via
+    // contractorWorkersByIdProvider — a real Customer read path, not just
+    // the owning Contractor/Admin).
+    match /contractor_workers/{workerId} {
+      // القراءة: المقاول صاحب العامل يقرأ عماله فقط (الاستعلام الحقيقي
+      // where('contractorId', isEqualTo: uid))، والعميل يستطيع تصفح عمال أي
+      // مقاول عبر صفحة الملف الشخصي العامة للمزوّد (مسار حقيقي مثبت)،
+      // والأدمن يقرأ الكل. لا مسار حقيقي لقراءة Professional أو مقاول آخر.
+      allow read: if request.auth != null
+        && (
+          resource.data.contractorId == request.auth.uid
+          || isAdmin()
+          || requesterRoleMatchesAccount('customer')
+        );
+
+      // الإنشاء: مقاول موقّع فقط (بدور contractor حقيقي في وثيقته)
+      // يستطيع إنشاء عامل خاص به، بمعرف وثيقة مطابق للمعرف الحقيقي
+      // (ContractorWorkersService.add يكتب دائمًا id: docRef.id)،
+      // وبقيم ابتدائية آمنة لحقول التقييم/عدد المهام، وبدون حقول غير معروفة.
+      // لا يوجد مسار إنشاء حقيقي لعامل من قِبل الأدمن أو أي دور آخر.
+      allow create: if request.auth != null
+        && requesterRoleMatchesAccount('contractor')
+        && request.resource.data.contractorId == request.auth.uid
+        && request.resource.data.id == workerId
+        && request.resource.data.contractorName is string
+        && request.resource.data.fullName is string
+        && request.resource.data.specialty is string
+        && request.resource.data.specialties is list
+        && request.resource.data.status in ['available', 'busy', 'offline']
+        && request.resource.data.rating == 0
+        && request.resource.data.completedJobs == 0
+        && request.resource.data.keys().hasOnly([
+          'id', 'contractorId', 'contractorName', 'fullName', 'specialty',
+          'specialties', 'phone', 'email', 'city', 'workArea', 'languages',
+          'experienceYears', 'workHours', 'workStartTime', 'workEndTime',
+          'status', 'rating', 'completedJobs', 'skills', 'description',
+          'createdAt', 'updatedAt'
+        ]);
+
+      // التعديل: المقاول صاحب العامل يستطيع تعديل الحقول الحقيقية المستخدمة
+      // من نموذج تعديل العامل الحقيقي (ContractorWorkersService.update)
+      // فقط، والأدمن يستطيع تعديل الحقول الحقيقية المستخدمة من نافذة تعديل
+      // العامل في لوحة الأدمن فقط (ContractorWorkersService.updateFields /
+      // _AdminEditWorkerDialog) — مع بقاء contractorId وcreatedAt (ومعرف
+      // العامل الحقيقي إن وُجد) دون تغيير في الحالتين. لا مسار تعديل حقيقي
+      // لمقاول آخر أو عميل أو Professional.
+      allow update: if request.auth != null
+        && request.resource.data.contractorId == resource.data.contractorId
+        && request.resource.data.get('id', workerId) == workerId
+        && request.resource.data.get('createdAt', null)
+          == resource.data.get('createdAt', null)
+        && (
+          (
+            resource.data.contractorId == request.auth.uid
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+              'id', 'contractorName', 'fullName', 'specialty', 'specialties',
+              'phone', 'email', 'city', 'workArea', 'languages',
+              'experienceYears', 'workHours', 'workStartTime', 'workEndTime',
+              'status', 'skills', 'description', 'updatedAt'
+            ])
+          )
+          || (
+            isAdmin()
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+              'fullName', 'specialty', 'specialties', 'phone', 'email',
+              'city', 'workArea', 'languages', 'experienceYears',
+              'workHours', 'workStartTime', 'workEndTime', 'status',
+              'skills', 'description', 'updatedAt'
+            ])
+          )
+        );
+
+      // الحذف: المقاول صاحب العامل فقط يستطيع حذفه — لا يوجد مسار حذف حقيقي
+      // للأدمن (ContractorWorkersService.delete يُستدعى فقط من شاشة
+      // المقاول نفسه).
+      allow delete: if request.auth != null
+        && resource.data.contractorId == request.auth.uid;
+    }
+
+    // Phase 3B2 hardening. Real code paths proven in Phase 3B1 analysis:
+    // lib/features/auth/presentation/providers/app_providers.dart
+    // (OrdersNotifier + customer/professional/contractor/admin order
+    // streams), lib/shared/models/models.dart (OrderModel),
+    // lib/features/customer/presentation/screens/new_order_screen.dart
+    // (real Create Order / Custom Request flow) and customer_orders_screen.dart
+    // (Edit/Cancel/Photo), lib/features/professional/presentation/screens/
+    // professional_home_screen.dart (Accept/Reject/Complete), lib/features/
+    // contractor/presentation/screens/contractor_home_screen.dart and
+    // contractor_order_detail_screen.dart (Accept/Reject/Complete/Assign/
+    // Reassign/Unassign), lib/features/admin/presentation/screens/
+    // admin_screens.dart (Approve/Complete/Cancel/Edit fields/Reassign
+    // worker — all gated in the real UI to pending/inProgress only).
+    match /orders/{orderId} {
+      // كل الحقول التي لا يغيّرها أي مسار تعديل حقيقي — يجب أن تبقى ثابتة في
+      // كل فروع update أدناه. تُقرأ بأمان عبر get(key, null) للتوافق مع
+      // الطلبات القديمة التي قد تفتقد حقولًا اختيارية.
+      function orderIdentityUnchanged() {
+        return request.resource.data.get('id', orderId) == orderId
+          && request.resource.data.customerId == resource.data.customerId
+          && request.resource.data.get('customerName', null)
+            == resource.data.get('customerName', null)
+          && request.resource.data.get('customerPhone', null)
+            == resource.data.get('customerPhone', null)
+          && request.resource.data.providerId == resource.data.providerId
+          && request.resource.data.get('providerName', null)
+            == resource.data.get('providerName', null)
+          && request.resource.data.get('providerPhone', null)
+            == resource.data.get('providerPhone', null)
+          && request.resource.data.get('providerRole', null)
+            == resource.data.get('providerRole', null)
+          && request.resource.data.get('categoryId', null)
+            == resource.data.get('categoryId', null)
+          && request.resource.data.get('categoryNameKey', null)
+            == resource.data.get('categoryNameKey', null)
+          && request.resource.data.get('serviceType', null)
+            == resource.data.get('serviceType', null)
+          && request.resource.data.get('photoPath', null)
+            == resource.data.get('photoPath', null)
+          && request.resource.data.get('createdAt', null)
+            == resource.data.get('createdAt', null);
+      }
+
+      // المُقدِّم (Professional/Contractor) الفاعل يجب أن يملك الطلب فعليًا
+      // (providerId == uid) وأن يكون دوره الحقيقي المخزّن في وثيقته مطابقًا،
+      // مع قبول الطلبات القديمة التي قد تفتقد حقل providerRole أصلًا —
+      // لا يُحظر مسار شرعي فقط لأن الحقل غائب في وثيقة قديمة.
+      function actingRoleMatchesProvider(role) {
+        return resource.data.providerId == request.auth.uid
+          && requesterRoleMatchesAccount(role)
+          && (!('providerRole' in resource.data) || resource.data.providerRole == role);
+      }
+
+      // يتحقق أن العامل المُسنَد فعليًا مملوك لمقاول الطلب نفسه
+      // (resource.data.providerId) عبر contractor_workers/{workerId}.contractorId —
+      // نفس القاعدة المثبتة في Phase 3A.
+      function workerBelongsToProvider(workerId) {
+        return exists(/databases/$(database)/documents/contractor_workers/$(workerId))
+          && get(/databases/$(database)/documents/contractor_workers/$(workerId)).data.contractorId
+            == resource.data.providerId;
+      }
+
+      // Phase 3B3: يتحقق من عنصر واحد في assignedWorkers[] — شكل
+      // AssignedWorkerSnapshot الحقيقي (id/name/specialties فقط) بالإضافة
+      // إلى ملكية العامل الفعلية لمقاول الطلب. يُستخدم على فهارس ثابتة فقط
+      // (0..4) لأن Firestore Rules لا يمكنه التكرار على مصفوفة غير محدودة
+      // الطول — انظر assignedWorkersValid() أدناه للحد الأقصى المعتمد
+      // للمنتج (5 عمال لكل طلب).
+      // ملاحظة أداء: exists() ثم get() على نفس المسار يكلّفان قراءتين فعليتين
+      // لكل عنصر (10 لخمسة عناصر) وقد تجاوز ذلك ميزانية Firestore عند
+      // الاختبار الفعلي. get() وحدها على وثيقة غير موجودة تُخفق بأمان (تُرفض
+      // الكتابة) دون الحاجة لاستدعاء exists() منفصل أولًا — نفس ضمان "يجب أن
+      // يكون العامل موجودًا" لكن بقراءة واحدة فقط لكل عنصر.
+      function validAssignedWorkerEntry(entry) {
+        return entry is map
+          && entry.keys().hasOnly(['id', 'name', 'specialties'])
+          && entry.id is string && entry.id.size() > 0
+          && get(/databases/$(database)/documents/contractor_workers/$(entry.id)).data.contractorId
+            == resource.data.providerId;
+      }
+
+      // Phase 3B3: يتحقق من كامل assignedWorkers[] فقط عندما يتغيّر فعليًا في
+      // هذه الكتابة (keys من diff().affectedKeys()، محسوبة مرة واحدة في
+      // المتصل) — طلب قديم يملك أكثر من 5 عمال من قبل هذه المرحلة لا يُحظر
+      // من إجراء إجراء آخر غير متعلق بالإسناد طالما لم يلمس assignedWorkers.
+      // أي إعادة إسناد فعلية على ذلك الطلب يجب أن تنتج قائمة من 5 عمال كحد
+      // أقصى (قرار منتج مُعتمَد).
+      function assignedWorkersValid(keys) {
+        return !keys.hasAny(['assignedWorkers'])
+          || !('assignedWorkers' in request.resource.data)
+          || (
+            request.resource.data.assignedWorkers is list
+            && request.resource.data.assignedWorkers.size() <= 5
+            && (request.resource.data.assignedWorkers.size() < 1
+              || validAssignedWorkerEntry(request.resource.data.assignedWorkers[0]))
+            && (request.resource.data.assignedWorkers.size() < 2
+              || validAssignedWorkerEntry(request.resource.data.assignedWorkers[1]))
+            && (request.resource.data.assignedWorkers.size() < 3
+              || validAssignedWorkerEntry(request.resource.data.assignedWorkers[2]))
+            && (request.resource.data.assignedWorkers.size() < 4
+              || validAssignedWorkerEntry(request.resource.data.assignedWorkers[3]))
+            && (request.resource.data.assignedWorkers.size() < 5
+              || validAssignedWorkerEntry(request.resource.data.assignedWorkers[4]))
+          );
+      }
+
+      // Phase 3B3: يتحقق من تطابق assignedWorkerId مع أول عنصر في
+      // assignedWorkers (المرآة الحقيقية التي يكتبها الكود دائمًا)، وملكية
+      // assignedWorkerId عندما تتغيّر بمفردها بدون assignedWorkers — فقط
+      // عندما تتغيّر إحدى حقول الإسناد فعليًا في هذه الكتابة.
+      function assignedWorkerMirrorValid(keys) {
+        return !keys.hasAny([
+            'assignedWorkerId', 'assignedWorkerName', 'assignedWorkerPhone',
+            'assignedWorkerSpecialty', 'assignedWorkerEmail', 'assignedWorkers'
+          ])
+          || (
+            (
+              !('assignedWorkers' in request.resource.data)
+              && (!('assignedWorkerId' in request.resource.data)
+                || workerBelongsToProvider(request.resource.data.assignedWorkerId))
+            )
+            || (
+              ('assignedWorkers' in request.resource.data)
+              && (
+                request.resource.data.assignedWorkers.size() == 0
+                || ('assignedWorkerId' in request.resource.data
+                  && request.resource.data.assignedWorkerId
+                    == request.resource.data.assignedWorkers[0].id)
+              )
+            )
+          );
+      }
+
+      // Phase 3B3: يمنع تسرّب حقول علامة تحويل حالة إلى كتابة تنتمي لتحويل
+      // آخر (مثال: كتابة completedBy أثناء عملية قبول فقط)، وحقول تحرير
+      // الأدمن (editedBy/editedAt) لا تتغيّر إلا لفاعل أدمن حقيقي. `keys`
+      // هي diff().affectedKeys() محسوبة مرة واحدة في المتصل وتُمرَّر بلا
+      // إعادة حساب.
+      function noCrossTransitionMarkers(keys) {
+        return (!keys.hasAny(['acceptedBy', 'acceptedAt'])
+            || (resource.data.status == 'pending' && request.resource.data.status == 'inProgress')
+            // استثناء حقيقي: unassignAllWorkersAndReturnToPendingInFirestore
+            // يحذف acceptedBy/acceptedAt عند التراجع من inProgress إلى
+            // pending — يُسمح بذلك فقط كحذف (لا يُسمح بكتابة قيمة جديدة)
+            || (resource.data.status == 'inProgress' && request.resource.data.status == 'pending'
+              && !('acceptedBy' in request.resource.data)
+              && !('acceptedAt' in request.resource.data)))
+          && (!keys.hasAny(['completedBy', 'completedAt'])
+            || (resource.data.status == 'inProgress' && request.resource.data.status == 'completed'))
+          && (!keys.hasAny(['cancelledBy', 'cancelledAt', 'cancelReason', 'rejectReason'])
+            || (resource.data.status in ['pending', 'inProgress']
+              && request.resource.data.status == 'cancelled'))
+          && (!keys.hasAny(['editedBy', 'editedAt']) || isAdmin());
+      }
+
+      // القراءة: صاحب الطلب (العميل) أو المزوّد (Professional/Contractor)
+      // المُسنَد إليه الطلب أو الأدمن فقط. لا يوجد حساب مصادقة منفصل للعامل
+      // المُسنَد — وصوله يمر دائمًا عبر حساب المقاول صاحب الطلب.
+      allow read: if request.auth != null
+        && (
+          resource.data.customerId == request.auth.uid
+          || resource.data.providerId == request.auth.uid
+          || isAdmin()
+        );
+
+      // الإنشاء: عميل موقّع فقط (بدور customer حقيقي)، بمعرف وثيقة مطابق،
+      // بحالة pending فقط، لمزوّد حقيقي موجود (professional/contractor) غير
+      // نفسه، وبـ providerRole مطابق لدوره الحقيقي — يدعم كلا مساري
+      // "اختيار خدمة" و"طلب مخصص" (Custom Request) لأن كل حقول الخدمة
+      // المختارة اختيارية أصلًا. بدون أي حقول إسناد عامل/قبول/رفض/إكمال/
+      // إشراف عند الإنشاء (تُستبعد تلقائيًا عبر keys().hasOnly).
+      allow create: if request.auth != null
+        && requesterRoleMatchesAccount('customer')
+        && request.resource.data.customerId == request.auth.uid
+        && request.resource.data.id == orderId
+        && request.resource.data.status == 'pending'
+        && request.resource.data.providerId != request.resource.data.customerId
+        && exists(/databases/$(database)/documents/users/$(request.resource.data.providerId))
+        && get(/databases/$(database)/documents/users/$(request.resource.data.providerId)).data.role
+          in ['professional', 'contractor']
+        && request.resource.data.providerRole
+          == get(/databases/$(database)/documents/users/$(request.resource.data.providerId)).data.role
+        && request.resource.data.priority in ['normal', 'urgent']
+        && request.resource.data.title is string
+        && request.resource.data.description is string
+        && request.resource.data.area is string
+        && request.resource.data.serviceDate is string
+        && request.resource.data.createdAt is string
+        && request.resource.data.updatedAt is string
+        && (!('imageUrls' in request.resource.data) || request.resource.data.imageUrls is list)
+        && (!('selectedServices' in request.resource.data) || request.resource.data.selectedServices is list)
+        && request.resource.data.keys().hasOnly([
+          'id', 'customerId', 'customerName', 'customerPhone', 'providerId',
+          'providerName', 'providerPhone', 'providerRole', 'title', 'description',
+          'area', 'selectedServiceId', 'selectedServiceName', 'selectedServicePrice',
+          'selectedServices', 'serviceDate', 'status', 'priority', 'photoPath',
+          'createdAt', 'updatedAt', 'categoryId', 'categoryNameKey', 'imageUrls'
+        ]);
+
+      // ملاحظة أداء (مهمة جدًا): Firestore يفرض حدًا إجماليًا قدره 1000 "تعبير
+      // قابل للتقييم" لكل طلب كتابة واحد — وهذه الميزانية مشتركة عبر كل
+      // عبارات allow المطابقة لنفس نوع العملية (وليست ميزانية مستقلة لكل
+      // عبارة على حدة)، لأن Firestore يجب أن يُقيّم كل عبارة update لم تمنح
+      // الإذن بعد عندما تُرفض الكتابة في النهاية. جُرِّب أولًا تصميم بعبارة
+      // allow update واحدة ضخمة (OR واحد كبير)، ثم تصميم بـ18 عبارة منفصلة
+      // (فرع لكل تحويل حالة)، ثم بـ6 عبارات مُجمَّعة حسب الفاعل — وكلها
+      // تجاوزت هذا الحد فعليًا عند اختبارها على المحاكي، لأن استدعاء
+      // orderIdentityUnchanged() و request.resource.data.diff(resource.data)
+      // .affectedKeys() بشكل متكرر — مرة لكل فرع/عبارة — كان يستهلك الميزانية
+      // تراكميًا. الحل: عبارة allow update واحدة فقط، تحسب
+      // orderIdentityUnchanged() و diff().affectedKeys() مرة واحدة لكل منهما
+      // ثم تُمرَّر قيمة affectedKeys (`keys`) كمعامل عبر كل الدوال أدناه بدل
+      // إعادة حسابها. Phase 3B3 تضيف فوقها فحوصًا إضافية (اتساق علامات
+      // التحويل عبر noCrossTransitionMarkers، وتحقق قائمة العمال الكاملة عبر
+      // assignedWorkersValid) بنفس الأسلوب — قيم keys محسوبة مرة واحدة.
+      function ordersUpdateAllowed(keys) {
+        return noCrossTransitionMarkers(keys)
+          && (
+            customerOrderBranch(keys)
+            || professionalOrderBranch(keys)
+            || contractorOrderBranch(keys)
+            || adminOrderStatusBranch(keys)
+            || adminOrderEditReassignBranch(keys)
+          );
+      }
+
+      // العميل صاحب الطلب: تعديل المحتوى والصور معًا — pending أو inProgress،
+      // بدون تغيير الحالة؛ أو الإلغاء — pending فقط، بواسم العميل حصرًا
+      function customerOrderBranch(keys) {
+        return (
+          resource.data.customerId == request.auth.uid
+          && resource.data.status in ['pending', 'inProgress']
+          && request.resource.data.status == resource.data.status
+          && keys.hasOnly([
+            'title', 'description', 'area', 'serviceDate', 'priority',
+            'selectedServices', 'selectedServiceId', 'selectedServiceName',
+            'selectedServicePrice', 'imageUrls', 'updatedAt'
+          ])
+        ) || (
+          resource.data.customerId == request.auth.uid
+          && resource.data.status == 'pending'
+          && request.resource.data.status == 'cancelled'
+          && request.resource.data.cancelledBy == 'customer'
+          && keys.hasOnly(['status', 'updatedAt', 'cancelledBy', 'cancelledAt', 'cancelReason'])
+        );
+      }
+
+      // Professional المُسنَد إليه الطلب: قبول/رفض/إكمال — noCrossTransitionMarkers
+      // أعلاه يضمن أن حقول تحويل آخر (كإكمال أثناء قبول) لا تتسرّب هنا
+      function professionalOrderBranch(keys) {
+        return actingRoleMatchesProvider('professional')
+          && (
+            (resource.data.status == 'pending' && request.resource.data.status == 'inProgress'
+              && request.resource.data.acceptedBy == 'professional')
+            || (resource.data.status == 'pending' && request.resource.data.status == 'cancelled'
+              && request.resource.data.cancelledBy == 'professional')
+            || (resource.data.status == 'inProgress' && request.resource.data.status == 'completed'
+              && request.resource.data.completedBy == 'professional')
+          )
+          && keys.hasOnly([
+            'status', 'updatedAt', 'acceptedBy', 'acceptedAt',
+            'cancelledBy', 'cancelledAt', 'rejectReason', 'cancelReason',
+            'completedBy', 'completedAt'
+          ]);
+      }
+
+      // Contractor المُسنَد إليه الطلب: قبول/رفض/إكمال/إسناد عامل (بلا تغيير
+      // حالة، أو مع قبول أول مرة)/إلغاء كل الإسناد والعودة لـ pending. كل
+      // عامل مُسنَد (assignedWorkerId والقائمة الكاملة حتى 5 عناصر) يجب أن
+      // يكون مملوكًا فعليًا لهذا المقاول — pending/inProgress فقط، أبدًا على
+      // طلب مكتمل أو ملغى.
+      function contractorOrderBranch(keys) {
+        return actingRoleMatchesProvider('contractor')
+          && assignedWorkerMirrorValid(keys)
+          && assignedWorkersValid(keys)
+          && (
+            (resource.data.status == 'pending' && request.resource.data.status == 'inProgress'
+              && request.resource.data.acceptedBy == 'contractor')
+            || (resource.data.status == 'pending' && request.resource.data.status == 'cancelled'
+              && request.resource.data.cancelledBy == 'contractor')
+            || (resource.data.status == 'inProgress' && request.resource.data.status == 'completed'
+              && request.resource.data.completedBy == 'contractor')
+            || (resource.data.status in ['pending', 'inProgress']
+              && request.resource.data.status == resource.data.status)
+            || (resource.data.status == 'inProgress' && request.resource.data.status == 'pending')
+          )
+          && keys.hasOnly([
+            'status', 'updatedAt', 'acceptedBy', 'acceptedAt',
+            'cancelledBy', 'cancelledAt', 'rejectReason', 'cancelReason',
+            'completedBy', 'completedAt',
+            'assignedWorkerId', 'assignedWorkerName', 'assignedWorkerPhone',
+            'assignedWorkerSpecialty', 'assignedWorkerEmail', 'assignedWorkers'
+          ]);
+      }
+
+      // الأدمن: موافقة/إكمال/إلغاء — بدون أي حقول إسناد أو تحرير
+      function adminOrderStatusBranch(keys) {
+        return isAdmin()
+          && (
+            (resource.data.status == 'pending' && request.resource.data.status == 'inProgress'
+              && request.resource.data.acceptedBy == 'admin')
+            || (resource.data.status == 'inProgress' && request.resource.data.status == 'completed'
+              && request.resource.data.completedBy == 'admin')
+            || (resource.data.status in ['pending', 'inProgress']
+              && request.resource.data.status == 'cancelled'
+              && request.resource.data.cancelledBy == 'admin')
+          )
+          && keys.hasOnly([
+            'status', 'updatedAt', 'a12cceptedBy', 'acceptedAt',
+            'completedBy', 'completedAt', 'cancelledBy', 'cancelledAt',
+            'cancelReason', 'rejectReason'
+          ]);
+      }
+
+      // الأدمن: تعديل العنوان/الوصف/المنطقة/الموعد وإعادة إسناد عامل (مع/بدون
+      // قبول أول مرة) — pending أو inProgress فقط. الأدمن لا يكتب
+      // assignedWorkers (القائمة) أبدًا، فقط الحقول المفردة القديمة —
+      // assignedWorkersValid() تتجاوَز تلقائيًا لأن 'assignedWorkers' لا يكون
+      // ضمن keys هنا.
+      function adminOrderEditReassignBranch(keys) {
+        return isAdmin()
+          && resource.data.status in ['pending', 'inProgress']
+          && request.resource.data.editedBy == 'admin'
+          && assignedWorkerMirrorValid(keys)
+          && (
+            (request.resource.data.status == resource.data.status)
+            || (resource.data.status == 'pending' && request.resource.data.status == 'inProgress'
+              && request.resource.data.acceptedBy == 'admin')
+          )
+          && keys.hasOnly([
+            'title', 'description', 'area', 'serviceDate',
+            'assignedWorkerId', 'assignedWorkerName', 'assignedWorkerPhone',
+            'assignedWorkerSpecialty', 'assignedWorkerEmail',
+            'status', 'acceptedBy', 'acceptedAt', 'editedBy', 'editedAt', 'updatedAt'
+          ]);
+      }
+
+      allow update: if request.auth != null
+        && orderIdentityUnchanged()
+        && ordersUpdateAllowed(request.resource.data.diff(resource.data).affectedKeys());
+
+      // لا يوجد مسار حذف فعلي للطلبات في التطبيق — الإلغاء يتم دائمًا عبر
+      // status: 'cancelled'، وليس حذف الوثيقة (OrdersNotifier.deleteOrder
+      // يعدّل الحالة المحلية فقط ولا يستدعي Firestore على الإطلاق).
+      allow delete: if false;
+    }
+
+    match /favorites/{favoriteId} {
+      // العميل يستطيع قراءة مفضلاته الخاصة فقط.
+      // resource == null يغطي حالة قراءة مستند لم يُنشأ بعد (توجد فعليًا في
+      // toggleFavoriteInFirestore/isFavoriteProvider لكل مزوّد لم يُضَف بعد):
+      // بدون هذا الشرط تُقيَّم resource.data على null فتفشل القاعدة بالكامل
+      // بخطأ permission-denied بدلاً من إرجاع "غير موجود" ببساطة.
+      allow read: if request.auth != null
+        && (resource == null || resource.data.customerId == request.auth.uid);
+
+      // فقط عميل موقّع يستطيع إضافة مزوّد إلى مفضلته الخاصة،
+      // بمعرف وثيقة حتمي {customerId}_{providerId}،
+      // ولمزوّد حقيقي (professional/contractor) غير نفسه
+      allow create: if request.auth != null
+        && request.resource.data.customerId == request.auth.uid
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'customer'
+        && request.resource.data.providerId is string
+        && request.resource.data.providerId != request.resource.data.customerId
+        && exists(/databases/$(database)/documents/users/$(request.resource.data.providerId))
+        && get(/databases/$(database)/documents/users/$(request.resource.data.providerId)).data.role
+          in ['professional', 'contractor']
+        && request.resource.data.providerRole
+          == get(/databases/$(database)/documents/users/$(request.resource.data.providerId)).data.role
+        && favoriteId == request.resource.data.customerId + '_' + request.resource.data.providerId
+        && request.resource.data.keys().hasOnly([
+          'customerId', 'providerId', 'providerName', 'providerRole',
+          'providerCategory', 'providerImageUrl', 'createdAt'
+        ]);
+
+      // لا يوجد مسار تعديل حقيقي للمفضلة في التطبيق الحالي
+      allow update: if false;
+
+      // العميل صاحب المفضلة فقط يستطيع حذفها
+      allow delete: if request.auth != null
+        && resource.data.customerId == request.auth.uid
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'customer';
+    }
+
+    match /reviews/{reviewId} {
+      // أي مستخدم موقّع يستطيع قراءة المراجعات — التصفية حسب isHidden/status
+      // تتم من جانب العميل (providerReviewsProvider)، والأدمن يقرأ الكل بدون
+      // فلترة (allReviewsProvider)، وروابط الإشعارات تفتح مراجعة مخفية أيضًا
+      allow read: if request.auth != null;
+
+      // فقط عميل موقّع يستطيع إنشاء مراجعة خاصة به، بمعرف وثيقة حتمي
+      // {customerId}_{providerId} أو {customerId}_{providerId}_{orderId}،
+      // ولمزوّد حقيقي (professional/contractor) غير نفسه، وبقيم افتراضية
+      // آمنة لحقول الإشراف عند الإنشاء
+      allow create: if request.auth != null
+        && request.resource.data.customerId == request.auth.uid
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'customer'
+        && request.resource.data.providerId is string
+        && request.resource.data.providerId != request.resource.data.customerId
+        && exists(/databases/$(database)/documents/users/$(request.resource.data.providerId))
+        && get(/databases/$(database)/documents/users/$(request.resource.data.providerId)).data.role
+          in ['professional', 'contractor']
+        && request.resource.data.providerRole
+          == get(/databases/$(database)/documents/users/$(request.resource.data.providerId)).data.role
+        && (
+          ('orderId' in request.resource.data)
+            ? reviewId == request.resource.data.customerId + '_' + request.resource.data.providerId
+              + '_' + request.resource.data.orderId
+            : reviewId == request.resource.data.customerId + '_' + request.resource.data.providerId
+        )
+        && request.resource.data.speedRating >= 0
+        && request.resource.data.qualityRating >= 0
+        && request.resource.data.communicationRating >= 0
+        && request.resource.data.status == 'visible'
+        && request.resource.data.isHidden == false
+        && request.resource.data.reportCount == 0
+        && !('reportReason' in request.resource.data)
+        && !('updatedAt' in request.resource.data)
+        && request.resource.data.keys().hasOnly([
+          'customerId', 'customerName', 'providerId', 'providerName', 'providerRole',
+          'orderId', 'speedRating', 'qualityRating', 'communicationRating',
+          'criteriaRatings', 'rating', 'comment', 'relatedService',
+          'createdAt', 'status', 'isHidden', 'reportCount'
+        ]);
+
+      // العميل صاحب المراجعة يستطيع تعديل محتواها أو حذفها حذفًا ناعمًا فقط،
+      // والمزوّد المُقيَّم يستطيع الإبلاغ عن مراجعته الخاصة فقط،
+      // والأدمن يستطيع الإشراف (hide/unhide/soft-delete/mark-safe) أو تعديل
+      // نص التعليق فقط (Admin Edit Review) — مع بقاء هوية المراجعة ثابتة دائمًا
+      allow update: if request.auth != null
+        && request.resource.data.customerId == resource.data.customerId
+        && request.resource.data.providerId == resource.data.providerId
+        && request.resource.data.createdAt == resource.data.createdAt
+        && (
+          (
+            resource.data.customerId == request.auth.uid
+            && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+            && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'customer'
+            && request.resource.data.diff(resource.data).affectedKeys()
+              .hasOnly(['comment', 'speedRating', 'qualityRating', 'communicationRating',
+                'criteriaRatings', 'relatedService', 'rating', 'updatedAt'])
+            && request.resource.data.speedRating >= 0
+            && request.resource.data.qualityRating >= 0
+            && request.resource.data.communicationRating >= 0
+          )
+          || (
+            resource.data.customerId == request.auth.uid
+            && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+            && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'customer'
+            && request.resource.data.diff(resource.data).affectedKeys()
+              .hasOnly(['isHidden', 'status', 'updatedAt'])
+            && request.resource.data.isHidden == true
+            && request.resource.data.status == 'deleted'
+          )
+          || (
+            resource.data.providerId == request.auth.uid
+            && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+            && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role
+              in ['professional', 'contractor']
+            && request.resource.data.diff(resource.data).affectedKeys()
+              .hasOnly(['reportCount', 'reportReason', 'updatedAt'])
+            && request.resource.data.reportReason is string
+            && request.resource.data.reportCount == resource.data.get('reportCount', 0) + 1
+          )
+          || (
+            isAdmin()
+            && (
+              (
+                request.resource.data.diff(resource.data).affectedKeys()
+                  .hasOnly(['isHidden', 'status', 'reportCount', 'reportReason', 'updatedAt'])
+                && request.resource.data.isHidden is bool
+                && (
+                  (request.resource.data.status == 'visible' && request.resource.data.isHidden == false)
+                  || (request.resource.data.status == 'hidden' && request.resource.data.isHidden == true)
+                  || (request.resource.data.status == 'deleted' && request.resource.data.isHidden == true)
+                )
+              )
+              || (
+                request.resource.data.diff(resource.data).affectedKeys()
+                  .hasOnly(['comment', 'updatedAt'])
+              )
+            )
+          )
+        );
+
+      allow delete: if false;
+    }
+
+    match /review_criteria/{criteriaId} {
+      allow read: if request.auth != null;
+      allow create, update, delete: if isAdmin();
+    }
+
+    // Complaints — Phase 5B hardening. Real code paths proven in Phase 5A
+    // analysis: lib/features/auth/presentation/providers/app_providers.dart
+    // (addComplaintInFirestore / updateComplaintInFirestore /
+    // softDeleteComplaintInFirestore / setComplaintStatusInFirestore /
+    // userComplaintsProvider / allComplaintsProvider), the per-role "New/Edit
+    // Complaint" sheets (customer_profile_screen.dart /
+    // professional_home_screen.dart / contractor_profile_screen.dart,
+    // customer_orders_screen.dart / professional_order_detail_screen.dart /
+    // contractor_order_detail_screen.dart, provider_profile_screen.dart), and
+    // the Admin Complaints Center (admin_complaints_screen.dart).
+    // lib/shared/models/models.dart (ComplaintModel). Only 4 of the 6 defined
+    // ComplaintType values have any real create call site
+    // (order_problem/provider_report/review_report/general_complaint) —
+    // customer_report/service_problem are Admin-display-only, never created.
+    // updateComplaintPriorityInFirestore/updateComplaintAdminNoteInFirestore
+    // are defined but never called by any real UI — priority never changes
+    // after creation, and the real admin-note flow goes through the same
+    // wide-open updateComplaintInFirestore() as the requester-edit and
+    // admin-reply flows (distinguished here only by ownership + diff keys).
+    match /complaints/{complaintId} {
+
+      // الحقول التي لا يغيّرها أي مسار تحديث حقيقي — تبقى ثابتة عبر كل فروع
+      // allow update أدناه (تعديل الشاكي، حذفه الناعم، أو أي إجراء إشرافي).
+      // نفس نمط reportIdentityUnchanged (Phase 4C2): الحقول الأساسية المطلوبة
+      // دائمًا (complainantId/complainantName/type/priority) تُقارَن مباشرة،
+      // والحقول الاختيارية عبر get(key, null) للتوافق مع الوثائق القديمة.
+      function complaintIdentityUnchanged() {
+        return request.resource.data.get('id', complaintId) == complaintId
+          && request.resource.data.complainantId == resource.data.complainantId
+          && request.resource.data.complainantName == resource.data.complainantName
+          && request.resource.data.get('complainantRole', null)
+            == resource.data.get('complainantRole', null)
+          && request.resource.data.type == resource.data.type
+          && request.resource.data.get('targetId', null) == resource.data.get('targetId', null)
+          && request.resource.data.get('targetName', null) == resource.data.get('targetName', null)
+          && request.resource.data.get('targetUserId', null)
+            == resource.data.get('targetUserId', null)
+          && request.resource.data.get('targetUserName', null)
+            == resource.data.get('targetUserName', null)
+          && request.resource.data.get('targetUserRole', null)
+            == resource.data.get('targetUserRole', null)
+          && request.resource.data.get('relatedOrderId', null)
+            == resource.data.get('relatedOrderId', null)
+          && request.resource.data.get('relatedOrderTitle', null)
+            == resource.data.get('relatedOrderTitle', null)
+          && request.resource.data.get('relatedProviderId', null)
+            == resource.data.get('relatedProviderId', null)
+          && request.resource.data.get('relatedProviderName', null)
+            == resource.data.get('relatedProviderName', null)
+          && request.resource.data.get('relatedReviewId', null)
+            == resource.data.get('relatedReviewId', null)
+          && request.resource.data.get('relatedConversationId', null)
+            == resource.data.get('relatedConversationId', null)
+          && request.resource.data.get('sourceContext', null)
+            == resource.data.get('sourceContext', null)
+          && request.resource.data.priority == resource.data.priority
+          && request.resource.data.get('createdAt', null) == resource.data.get('createdAt', null);
+      }
+
+      // شكل الإنشاء المشترك بين كل الأنواع الأربعة الحقيقية: الشاكي موقّع
+      // بدور حقيقي غير أدمن، complainantId يطابق الفاعل نفسه،
+      // complainantRole (إن وُجد) يطابق دوره المخزّن الحقيقي، بدون أي حقول
+      // إشراف مميّزة عند الإنشاء.
+      function complaintCommonCreateValid() {
+        return request.resource.data.id == complaintId
+          && request.resource.data.complainantId == request.auth.uid
+          && storedUserRole(request.auth.uid) in ['customer', 'professional', 'contractor']
+          && (!('complainantRole' in request.resource.data)
+            || requesterRoleMatchesAccount(request.resource.data.complainantRole))
+          && request.resource.data.complainantName is string
+          && request.resource.data.complainantName.size() > 0
+          && request.resource.data.reason is string
+          && request.resource.data.reason.size() > 0
+          && request.resource.data.title == request.resource.data.reason
+          && request.resource.data.description is string
+          && request.resource.data.status == 'open'
+          && request.resource.data.priority == 'medium'
+          && request.resource.data.isDeleted == false
+          && request.resource.data.createdAt is string
+          && !('updatedAt' in request.resource.data)
+          && !('resolvedAt' in request.resource.data)
+          && !('adminNote' in request.resource.data)
+          && !('replyText' in request.resource.data)
+          && !('repliedAt' in request.resource.data)
+          && !('repliedBy' in request.resource.data);
+      }
+
+      // مفاتيح الإنشاء المسموحة بالضبط بحسب النوع الحقيقي — targetUserId/
+      // targetUserName/targetUserRole وrelated* تختلف فعليًا بين الأنواع
+      // الأربعة (انظر خرائط الإنشاء الحقيقية المثبتة في Phase 5A).
+      function validCreateKeysForType(data) {
+        return data.type == 'order_problem'
+          ? data.keys().hasOnly([
+              'id', 'complainantId', 'complainantName', 'complainantRole', 'type',
+              'targetId', 'targetName', 'targetUserId', 'targetUserName', 'targetUserRole',
+              'title', 'reason', 'description', 'status', 'priority',
+              'relatedOrderId', 'relatedOrderTitle', 'relatedProviderId', 'relatedProviderName',
+              'sourceContext', 'createdAt', 'isDeleted'
+            ])
+          : data.type == 'provider_report'
+            ? data.keys().hasOnly([
+                'id', 'complainantId', 'complainantName', 'complainantRole', 'type',
+                'targetId', 'targetName', 'targetUserId', 'targetUserName', 'targetUserRole',
+                'title', 'reason', 'description', 'status', 'priority',
+                'sourceContext', 'createdAt', 'isDeleted'
+              ])
+            : data.type == 'review_report'
+              ? data.keys().hasOnly([
+                  'id', 'complainantId', 'complainantName', 'complainantRole', 'type',
+                  'targetId', 'targetName', 'targetUserId', 'targetUserName', 'targetUserRole',
+                  'title', 'reason', 'description', 'status', 'priority',
+                  'relatedReviewId', 'relatedProviderId', 'relatedProviderName',
+                  'sourceContext', 'createdAt', 'isDeleted'
+                ])
+              : data.keys().hasOnly([
+                  'id', 'complainantId', 'complainantName', 'complainantRole', 'type',
+                  'targetId', 'targetName', 'title', 'reason', 'description', 'status',
+                  'priority', 'sourceContext', 'createdAt', 'isDeleted'
+                ]);
+      }
+
+      // order_problem: الفاعل يجب أن يكون أحد طرفي الطلب فعليًا (عميل أو
+      // مزوّد)، وtargetUserId (إن وُجد) يجب أن يطابق الطرف الآخر بالضبط.
+      function relatedOrderForComplaint() {
+        return get(/databases/$(database)/documents/orders/$(request.resource.data.relatedOrderId)).data;
+      }
+
+      function orderComplaintOtherParty() {
+        return relatedOrderForComplaint().customerId == request.auth.uid
+          ? relatedOrderForComplaint().providerId
+          : relatedOrderForComplaint().customerId;
+      }
+
+      function orderComplaintValid() {
+        return request.resource.data.sourceContext == 'order_details'
+          && request.resource.data.relatedOrderId is string
+          && (relatedOrderForComplaint().customerId == request.auth.uid
+            || relatedOrderForComplaint().providerId == request.auth.uid)
+          && (!('targetUserId' in request.resource.data)
+            || request.resource.data.targetUserId == orderComplaintOtherParty())
+          && (!('targetUserRole' in request.resource.data)
+            || (
+              'targetUserId' in request.resource.data
+              && request.resource.data.targetUserRole
+                == storedUserRole(request.resource.data.targetUserId)
+            ));
+      }
+
+      // provider_report: عميل موقّع فقط يبلّغ عن مزوّد حقيقي (professional
+      // أو contractor).
+      function providerComplaintValid() {
+        return requesterRoleMatchesAccount('customer')
+          && request.resource.data.sourceContext == 'provider_profile'
+          && request.resource.data.targetUserId is string
+          && storedUserRole(request.resource.data.targetUserId) in ['professional', 'contractor']
+          && (!('targetUserRole' in request.resource.data)
+            || request.resource.data.targetUserRole
+              == storedUserRole(request.resource.data.targetUserId));
+      }
+
+      // review_report: مزوّد (professional/contractor) موقّع يبلّغ عن مراجعة
+      // حقيقية هو صاحبها فعلًا (review.providerId == الفاعل)، وtargetUserId
+      // يطابق عميل تلك المراجعة نفسه بالضبط.
+      function relatedReviewForComplaint() {
+        return get(/databases/$(database)/documents/reviews/$(request.resource.data.relatedReviewId)).data;
+      }
+
+      function reviewReportComplaintValid() {
+        return storedUserRole(request.auth.uid) in ['professional', 'contractor']
+          && request.resource.data.sourceContext == 'review_report'
+          && request.resource.data.relatedReviewId is string
+          && relatedReviewForComplaint().providerId == request.auth.uid
+          && request.resource.data.targetUserId == relatedReviewForComplaint().customerId
+          && storedUserRole(request.resource.data.targetUserId) == 'customer'
+          && (!('targetUserRole' in request.resource.data)
+            || request.resource.data.targetUserRole == 'customer')
+          && (!('relatedProviderId' in request.resource.data)
+            || request.resource.data.relatedProviderId == request.auth.uid);
+      }
+
+      // general_complaint: بدون أي طرف/طلب/مراجعة مرتبطة — الاستبعاد الفعلي
+      // لـ targetUserId/relatedOrderId/relatedReviewId/relatedProviderId يتم
+      // عبر لائحة المفاتيح المسموحة في validCreateKeysForType أعلاه (ليست
+      // ضمنها إطلاقًا لهذا النوع).
+      function generalComplaintValid() {
+        return request.resource.data.targetId == 'general'
+          && request.resource.data.sourceContext == 'my_complaints';
+      }
+
+      // الإنشاء: فقط الأنواع الأربعة الحقيقية المُثبتة — customer_report/
+      // service_problem وأي نوع آخر مرفوضان دائمًا (لا مسار إنشاء حقيقي لهما).
+      function complaintCreateValid() {
+        return complaintCommonCreateValid()
+          && request.resource.data.type in [
+            'order_problem', 'provider_report', 'review_report', 'general_complaint'
+          ]
+          && validCreateKeysForType(request.resource.data)
+          && (
+            request.resource.data.type == 'order_problem' ? orderComplaintValid()
+            : request.resource.data.type == 'provider_report' ? providerComplaintValid()
+            : request.resource.data.type == 'review_report' ? reviewReportComplaintValid()
+            : generalComplaintValid()
+          );
+      }
+
+      // آ. تعديل الشاكي لشكوته الخاصة (updateComplaintInFirestore عبر
+      // copyWith(reason, description) فقط) — طالما الحالة لا تزال open أو
+      // in_review (نفس بوابة _canEditOrDelete الحقيقية المطابقة عبر الأدوار
+      // الثلاثة). الحالة وisDeleted يجب أن يبقيا دون تغيير.
+      function requesterEditBranch(keys) {
+        return resource.data.complainantId == request.auth.uid
+          && resource.data.status in ['open', 'in_review']
+          && request.resource.data.status == resource.data.status
+          && request.resource.data.isDeleted == resource.data.isDeleted
+          && request.resource.data.title == request.resource.data.reason
+          && keys.hasOnly(['reason', 'title', 'description', 'updatedAt']);
+      }
+
+      // ب. حذف الشاكي الناعم لشكوته الخاصة (softDeleteComplaintInFirestore)
+      // — طالما الحالة لا تزال open أو in_review.
+      function requesterSoftDeleteBranch(keys) {
+        return resource.data.complainantId == request.auth.uid
+          && resource.data.status in ['open', 'in_review']
+          && request.resource.data.status == 'deleted'
+          && request.resource.data.isDeleted == true
+          && keys.hasOnly(['status', 'isDeleted', 'updatedAt']);
+      }
+
+      // ج. تحديث حالة/ملاحظة الأدمن (setComplaintStatusInFirestore) — إمّا
+      // الإبقاء على الحالة الحالية (حفظ adminNote فقط)، أو الانتقال إلى
+      // in_review/resolved/rejected حصرًا — لا عودة إلى open أبدًا. resolvedAt
+      // لا يتغيّر إلا عند الانتقال الفعلي إلى resolved (القيمة القديمة تبقى
+      // كما هي بأمان عند تحويلات لاحقة، تمامًا كسلوك التطبيق الحقيقي).
+      function adminStatusNoteBranch(keys) {
+        return isAdmin()
+          && (
+            request.resource.data.status == resource.data.status
+            || request.resource.data.status in ['in_review', 'resolved', 'rejected']
+          )
+          && (!keys.hasAny(['resolvedAt']) || request.resource.data.status == 'resolved')
+          && (!('adminNote' in request.resource.data) || request.resource.data.adminNote is string)
+          && keys.hasOnly(['status', 'updatedAt', 'resolvedAt', 'adminNote']);
+      }
+
+      // د. ردّ الأدمن على الشاكي (updateComplaintInFirestore عبر
+      // copyWith(replyText, repliedAt, repliedBy)) — repliedBy يطابق القيمة
+      // الحقيقية الثابتة التي يكتبها الكود دائمًا.
+      function adminReplyBranch(keys) {
+        return isAdmin()
+          && request.resource.data.replyText is string
+          && request.resource.data.replyText.size() > 0
+          && request.resource.data.repliedBy == 'System Admin'
+          && keys.hasOnly(['replyText', 'repliedAt', 'repliedBy', 'updatedAt']);
+      }
+
+      // هـ. ملاحظة الأدمن الداخلية (updateComplaintInFirestore عبر
+      // copyWith(adminNote) فقط).
+      function adminNoteBranch(keys) {
+        return isAdmin()
+          && request.resource.data.adminNote is string
+          && keys.hasOnly(['adminNote', 'updatedAt']);
+      }
+
+      // و. حذف الأدمن الناعم لأي شكوى (softDeleteComplaintInFirestore) —
+      // بدون أي شرط على الحالة الحالية (نفس السلوك الحقيقي غير المقيَّد).
+      function adminSoftDeleteBranch(keys) {
+        return isAdmin()
+          && request.resource.data.status == 'deleted'
+          && request.resource.data.isDeleted == true
+          && keys.hasOnly(['status', 'isDeleted', 'updatedAt']);
+      }
+
+      function complaintUpdateAllowed(keys) {
+        return requesterEditBranch(keys)
+          || requesterSoftDeleteBranch(keys)
+          || adminStatusNoteBranch(keys)
+          || adminReplyBranch(keys)
+          || adminNoteBranch(keys)
+          || adminSoftDeleteBranch(keys);
+      }
+
+      // القراءة: صاحب الشكوى فقط (complainantId == uid) أو الأدمن. الوصول
+      // المباشر لحقل complainantId (لا get() بقيمة افتراضية) يجعل أي وثيقة
+      // قديمة تفتقده (userId/userName فقط) تُقيَّم بأمان: الشرط الأول يفشل
+      // بأمان (false) لأي غير أدمن، والأدمن يقرأها عبر isAdmin() المستقل عن
+      // resource.data تمامًا — أي أنها تبقى قابلة للقراءة من الأدمن فقط، دون
+      // إضعاف شرط القراءة العام لأي مستخدم آخر.
+      allow read: if request.auth != null
+        && (resource.data.complainantId == request.auth.uid || isAdmin());
+
+      allow create: if request.auth != null && complaintCreateValid();
+
+      // ملاحظة أداء: نفس نمط orders/conversations — عبارة allow update واحدة
+      // فقط، تحسب diff().affectedKeys() مرة واحدة وتمرّرها عبر كل الدوال أعلاه.
+      allow update: if request.auth != null
+        && complaintIdentityUnchanged()
+        && complaintUpdateAllowed(request.resource.data.diff(resource.data).affectedKeys());
+
+      // لا يوجد مسار حذف فعلي فعليًا — الحذف دائمًا حذف ناعم (isDeleted)
+      // عبر allow update أعلاه.
+      allow delete: if false;
+    }
+
+    // ─── Notifications (Phase 5C2) ───────────────────────────────────────────
+    // Content (notifications/{id}) is immutable after creation — the sole
+    // source of truth for title/message/type/targeting/related IDs. Real
+    // per-user read/delete state lives in
+    // users/{uid}/notification_states/{notificationId} (below), never here.
+    // Visibility predicate shared by the content read rule and by the state
+    // subcollection's create rule (a user may only create state for a
+    // notification they could actually read). get() الآمن بالحقل الاختياري
+    // لأن userId/targetRole يُحذفان من toMap() عند القيمة null
+    // (NotificationModel.toMap).
+    function notifTargetsUser(data, uid) {
+      return data.get('userId', null) == uid
+        || data.get('targetRole', null) == storedUserRole(uid)
+        || data.get('targetRole', null) == 'all';
+    }
+
+    match /notifications/{notificationId} {
+      // القراءة: مستهدَف مباشرة (userId) أو حسب الدور المخزَّن فعليًا
+      // (storedUserRole) أو بث عام (targetRole == 'all'). لا قراءة غير
+      // مشروطة لأي أحد — الأدمن يُقرأ فقط عبر أحد هذه الفروع الثلاثة تمامًا
+      // كأي دور آخر (userId == admin uid، أو targetRole == 'admin'، أو
+      // targetRole == 'all').
+      allow read: if request.auth != null
+        && notifTargetsUser(resource.data, request.auth.uid);
+
+      // قاعدة ثابتة لكل وثيقة جديدة بصرف النظر عن المُنتِج — تطابق تمامًا
+      // الحقول التي يكتبها NotificationModel.toMap() + الإضافة الثابتة
+      // لحقل id في كل نقاط الإنشاء الحقيقية (addNotificationInFirestore/
+      // sendUserWarningNotification/sendBroadcastNotificationInFirestore).
+      function notifBaseValid() {
+        return request.resource.data.id == notificationId
+          && request.resource.data.title is string
+          && request.resource.data.title.size() > 0
+          && request.resource.data.message is string
+          && request.resource.data.message.size() > 0
+          && request.resource.data.createdAt is string
+          && request.resource.data.isRead == false
+          && request.resource.data.isDeleted == false
+          && !('readAt' in request.resource.data);
+      }
+
+      // createdById/createdByName/createdByRole عندما تُكتب (اختياريًا حسب
+      // المُنتِج) يجب أن تكون نصوصًا — القيمة الفعلية لكل فرع تُحقَّق أدناه.
+      function notifCreatorFieldsValid() {
+        return (!('createdById' in request.resource.data)
+              || request.resource.data.createdById is string)
+          && (!('createdByName' in request.resource.data)
+              || request.resource.data.createdByName is string)
+          && (!('createdByRole' in request.resource.data)
+              || request.resource.data.createdByRole is string);
+      }
+
+      // أ. order_update — createOrderNotification. المُنتِج الحقيقي دائمًا:
+      // عميل الطلب (طلب جديد → المزوّد)، أو مزوّد الطلب (قبول/رفض/إكمال/
+      // تعيين عامل → العميل)، أو الأدمن (اعتماد/إكمال → العميل فقط — لا
+      // يوجد أي مسار Admin→Provider حقيقي في الكود المفحوص).
+      function orderNotifTargetValid(orderId) {
+        let order = get(/databases/$(database)/documents/orders/$(orderId)).data;
+        return (request.auth.uid == order.customerId
+              && request.resource.data.userId == order.providerId)
+          || (request.auth.uid == order.providerId
+              && request.resource.data.userId == order.customerId)
+          || (isAdmin() && request.resource.data.userId == order.customerId);
+      }
+
+      function orderUpdateCreateValid() {
+        return request.resource.data.type == 'order_update'
+          && request.resource.data.keys().hasOnly(
+            ['id', 'userId', 'title', 'message', 'type', 'relatedOrderId',
+             'isRead', 'createdAt', 'isDeleted'])
+          && 'relatedOrderId' in request.resource.data
+          && request.resource.data.relatedOrderId is string
+          && request.resource.data.relatedOrderId.size() > 0
+          && exists(/databases/$(database)/documents/orders/$(request.resource.data.relatedOrderId))
+          && orderNotifTargetValid(request.resource.data.relatedOrderId);
+      }
+
+      // ب. review — createReviewNotification (عميل → مزوّد عند تقييم جديد،
+      // أو أدمن → المُقيِّم عند إخفاء/استعادة المراجعة) وaddNotificationInFirestore
+      // المباشرة (تحذير أدمن للمُقيِّم). الفرعان الإداريان يستهدفان نفس
+      // الشخص (review.customerId) فلا حاجة لفرع Admin منفصل لكل حالة.
+      // createdByRole مقبول فقط في فرع الأدمن (تحذير المُقيِّم يكتبه فعليًا؛
+      // إخفاء/استعادة لا يكتبه) — العميل لا يكتب createdByRole في أي مسار
+      // حقيقي إطلاقًا، فادّعاؤه هوية أدمن في هذا الفرع مرفوض.
+      function reviewNotifTargetValid(reviewId) {
+        let review = get(/databases/$(database)/documents/reviews/$(reviewId)).data;
+        return (request.auth.uid == review.customerId
+              && request.resource.data.userId == review.providerId
+              && !('createdByRole' in request.resource.data)
+              && (!('relatedUserId' in request.resource.data)
+                  || request.resource.data.relatedUserId == review.customerId))
+          || (isAdmin()
+              && request.resource.data.userId == review.customerId
+              && (!('createdByRole' in request.resource.data)
+                  || request.resource.data.createdByRole == 'admin'));
+      }
+
+      function reviewCreateValid() {
+        return request.resource.data.type == 'review'
+          && request.resource.data.keys().hasOnly(
+            ['id', 'userId', 'title', 'message', 'type', 'relatedReviewId',
+             'relatedUserId', 'isRead', 'createdAt', 'isDeleted', 'createdByRole'])
+          && 'relatedReviewId' in request.resource.data
+          && request.resource.data.relatedReviewId is string
+          && request.resource.data.relatedReviewId.size() > 0
+          && exists(/databases/$(database)/documents/reviews/$(request.resource.data.relatedReviewId))
+          && reviewNotifTargetValid(request.resource.data.relatedReviewId);
+      }
+
+      // ج. complaint — createComplaintNotification. الشاكي الحقيقي دائمًا
+      // يستهدف targetRole:'admin' (بدون userId)؛ الأدمن الحقيقي دائمًا
+      // يستهدف userId == complaint.complainantId (بدون targetRole) عند
+      // تغيير الحالة.
+      // createdByRole مقبول فقط في فرع الأدمن (setComplaintStatusInFirestore
+      // يكتبه فعليًا دائمًا) — الشاكي لا يكتب createdByRole في المسار الحقيقي
+      // إطلاقًا (addComplaintInFirestore)، فادّعاؤه هوية أدمن هنا مرفوض.
+      function complaintNotifTargetValid(complaintId) {
+        let complaint = get(/databases/$(database)/documents/complaints/$(complaintId)).data;
+        return (request.auth.uid == complaint.complainantId
+              && request.resource.data.targetRole == 'admin'
+              && !('userId' in request.resource.data)
+              && !('createdByRole' in request.resource.data))
+          || (isAdmin()
+              && request.resource.data.userId == complaint.complainantId
+              && !('targetRole' in request.resource.data)
+              && (!('createdByRole' in request.resource.data)
+                  || request.resource.data.createdByRole == 'admin'));
+      }
+
+      function complaintNotifCreateValid() {
+        return request.resource.data.type == 'complaint'
+          && request.resource.data.keys().hasOnly(
+            ['id', 'userId', 'title', 'message', 'type', 'relatedComplaintId',
+             'relatedReviewId', 'isRead', 'createdAt', 'isDeleted',
+             'createdByRole', 'targetRole'])
+          && 'relatedComplaintId' in request.resource.data
+          && request.resource.data.relatedComplaintId is string
+          && request.resource.data.relatedComplaintId.size() > 0
+          && exists(/databases/$(database)/documents/complaints/$(request.resource.data.relatedComplaintId))
+          && complaintNotifTargetValid(request.resource.data.relatedComplaintId);
+      }
+
+      // د. category_request — createCategoryRequestNotification. Phase 5C3:
+      // relatedCategoryRequestId مطلوب الآن دائمًا لكلا الفرعين (المُنتِج
+      // الحقيقي يمرّره دائمًا في الفرعين بعد إصلاح Phase 5C3 —
+      // category_request_sheet.dart/professional_home_screen.dart/
+      // contractor_profile_screen.dart يلتقطون الآن معرّف الوثيقة الحقيقي من
+      // .add() قبل استدعاء الإشعار). فرع الطالب→الأدمن: الطالب يملك الطلب
+      // فعليًا، دوره المخزّن يطابق requesterRole المخزّن في الطلب (إن وُجد)،
+      // والطلب لا يزال pending. فرع الأدمن→الطالب: الترتيب الحقيقي في الكود
+      // يكتب حالة الطلب (approved/rejected) أولًا عبر batch ثم يُنشئ
+      // الإشعار بعده في try/catch منفصل، فحالة الطلب وقت إنشاء الإشعار تكون
+      // بالفعل approved أو rejected.
+      function categoryRequestNotifRequesterValid(categoryRequestId) {
+        let cr = get(/databases/$(database)/documents/category_requests/$(categoryRequestId)).data;
+        return cr.requesterId == request.auth.uid
+          && (cr.get('requesterRole', null) == null
+              || cr.get('requesterRole', null) == storedUserRole(request.auth.uid))
+          && cr.status == 'pending'
+          && storedUserRole(request.auth.uid) in ['customer', 'professional', 'contractor'];
+      }
+
+      function categoryRequestNotifAdminValid(categoryRequestId) {
+        let cr = get(/databases/$(database)/documents/category_requests/$(categoryRequestId)).data;
+        return isAdmin()
+          && request.resource.data.userId == cr.requesterId
+          && cr.status in ['approved', 'rejected'];
+      }
+
+      function categoryRequestNotifCreateValid() {
+        return request.resource.data.type == 'category_request'
+          && request.resource.data.keys().hasOnly(
+            ['id', 'userId', 'title', 'message', 'type',
+             'relatedCategoryRequestId', 'isRead', 'createdAt', 'isDeleted',
+             'targetRole'])
+          && 'relatedCategoryRequestId' in request.resource.data
+          && request.resource.data.relatedCategoryRequestId is string
+          && request.resource.data.relatedCategoryRequestId.size() > 0
+          && exists(/databases/$(database)/documents/category_requests/$(request.resource.data.relatedCategoryRequestId))
+          && (
+            (request.resource.data.targetRole == 'admin'
+              && !('userId' in request.resource.data)
+              && categoryRequestNotifRequesterValid(request.resource.data.relatedCategoryRequestId))
+            || (!('targetRole' in request.resource.data)
+              && categoryRequestNotifAdminValid(request.resource.data.relatedCategoryRequestId))
+          );
+      }
+
+      // هـ. system — createProfileUpdateNotification/createWorkerUpdateNotification/
+      // sendUserWarningNotification. الأدمن فقط، createdByRole == 'admin'
+      // ثابتة دائمًا في هذه المُنتِجات الثلاثة (مكتوبة مباشرة في الكود، ليست
+      // معطى من المستدعي)، userId يشير دائمًا لمستخدم حقيقي غير محذوف.
+      function systemNotifCreateValid() {
+        return request.resource.data.type == 'system'
+          && request.resource.data.keys().hasOnly(
+            ['id', 'userId', 'title', 'message', 'type', 'isRead',
+             'createdAt', 'isDeleted', 'createdById', 'createdByName',
+             'createdByRole'])
+          && isAdmin()
+          && request.resource.data.createdByRole == 'admin'
+          && 'userId' in request.resource.data
+          && request.resource.data.userId is string
+          && request.resource.data.userId.size() > 0
+          && exists(/databases/$(database)/documents/users/$(request.resource.data.userId))
+          && get(/databases/$(database)/documents/users/$(request.resource.data.userId))
+              .data.get('isDeleted', false) == false;
+      }
+
+      // و. broadcast — sendBroadcastNotificationInFirestore. الأدمن فقط،
+      // createdByRole == 'admin' ثابتة دائمًا (مكتوبة مباشرة في الكود)،
+      // targetRole أحد أربعة قيم فقط ولا يشمل 'admin' إطلاقًا (لا بث ذاتي
+      // للأدمن في الكود الحقيقي)، بلا userId وبلا أي related id.
+      function broadcastCreateValid() {
+        return request.resource.data.type == 'broadcast'
+          && request.resource.data.keys().hasOnly(
+            ['id', 'title', 'message', 'type', 'targetRole', 'isRead',
+             'createdAt', 'isDeleted', 'createdById', 'createdByName',
+             'createdByRole'])
+          && isAdmin()
+          && request.resource.data.createdByRole == 'admin'
+          && request.resource.data.targetRole
+              in ['all', 'customer', 'professional', 'contractor'];
+      }
+
+      // ز. general/chat: لا يوجد أي مُنتِج حقيقي حاليًا لهذين النوعين — لا
+      // فرع إنشاء لهما، فتُرفض أي محاولة إنشاء تلقائيًا (الوثائق القديمة إن
+      // وُجدت تبقى قابلة للقراءة فقط حسب قاعدة القراءة أعلاه دون أي تغيير).
+      allow create: if request.auth != null
+        && notifBaseValid()
+        && notifCreatorFieldsValid()
+        && (
+          orderUpdateCreateValid()
+          || reviewCreateValid()
+          || complaintNotifCreateValid()
+          || categoryRequestNotifCreateValid()
+          || systemNotifCreateValid()
+          || broadcastCreateValid()
+        );
+
+      // المحتوى ثابت تمامًا بعد الإنشاء — لا تعديل من أي أحد (بما فيه
+      // الأدمن)، حالة القراءة/الحذف الخاصة بكل مستخدم أصبحت في
+      // users/{uid}/notification_states/{notificationId} بدلًا من هذه
+      // الوثيقة. لا حذف فعلي أيضًا.
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    // ─── Per-user notification state (Phase 5C1B / 5C2) ──────────────────────
+    // مستقل تمامًا عن قاعدة users/{uid} أعلاه — لا وراثة تلقائية للقواعد
+    // للمجموعات الفرعية في Firestore، فهذا الـmatch صريح وكامل بذاته.
+    match /users/{uid}/notification_states/{notifId} {
+      // القراءة/الكتابة لصاحب الحالة فقط — لا استثناء للأدمن (لا مسار حقيقي
+      // مُثبت يحتاج قراءة حالة مستخدم آخر).
+      allow read: if request.auth != null && request.auth.uid == uid;
+
+      function stateIdentityValid() {
+        return request.resource.data.notificationId == notifId
+          && request.resource.data.userId == uid;
+      }
+
+      // معرّف الوثيقة حتمي (== notificationId)؛ الإنشاء upsert جزئي حقيقي من
+      // Flutter (mark-read أول فعل، أو soft-delete أول فعل) — يجب أن يمثّل
+      // فعلًا حقيقيًا واحدًا على الأقل، بلا قيم false صريحة، وموجّه لإشعار
+      // يستطيع هذا المستخدم قراءته فعليًا حسب نفس محكّ notifTargetsUser
+      // المستخدم في قاعدة قراءة notifications/{id}.
+      allow create: if request.auth != null && request.auth.uid == uid
+        && stateIdentityValid()
+        && request.resource.data.keys().hasOnly(
+          ['notificationId', 'userId', 'isRead', 'readAt', 'isDeleted', 'updatedAt'])
+        && 'updatedAt' in request.resource.data
+        && request.resource.data.updatedAt is string
+        && (!('isRead' in request.resource.data)
+            || request.resource.data.isRead == true)
+        && (!('isDeleted' in request.resource.data)
+            || request.resource.data.isDeleted == true)
+        && (!('readAt' in request.resource.data)
+            || (request.resource.data.readAt is string
+                && request.resource.data.get('isRead', false) == true))
+        && (request.resource.data.get('isRead', false) == true
+            || request.resource.data.get('isDeleted', false) == true)
+        && exists(/databases/$(database)/documents/notifications/$(notifId))
+        && notifTargetsUser(
+             get(/databases/$(database)/documents/notifications/$(notifId)).data, uid);
+
+      // التحديث: هوية الوثيقة (notificationId/userId) ثابتة؛ isRead/isDeleted
+      // أحادية الاتجاه فقط (false/غائب → true، أبدًا العكس)؛ readAt لا
+      // يُكتب/يتغيّر إلا مع isRead == true؛ حقل حالة حقيقي واحد على الأقل
+      // يتغيّر، وupdatedAt يتغيّر معه دائمًا.
+      function stateUpdateAllowed(keys) {
+        return keys.hasOnly(['isRead', 'readAt', 'isDeleted', 'updatedAt'])
+          && keys.hasAny(['updatedAt'])
+          && keys.hasAny(['isRead', 'isDeleted', 'readAt'])
+          && request.resource.data.notificationId == resource.data.notificationId
+          && request.resource.data.userId == resource.data.userId
+          && request.resource.data.updatedAt is string
+          && (resource.data.get('isRead', false) == false
+              || request.resource.data.get('isRead', false) == true)
+          && (resource.data.get('isDeleted', false) == false
+              || request.resource.data.get('isDeleted', false) == true)
+          && (!('readAt' in request.resource.data)
+              || (request.resource.data.readAt is string
+                  && request.resource.data.get('isRead', false) == true));
+      }
+
+      allow update: if request.auth != null && request.auth.uid == uid
+        && stateUpdateAllowed(request.resource.data.diff(resource.data).affectedKeys());
+
+      // لا حذف فعلي — soft-delete عبر isDeleted:true في allow update أعلاه
+      // فقط، بنفس منطق باقي المجموعات في هذا الملف (complaints وغيرها).
+      allow delete: if false;
+    }
+
+    // AI Assistant / Translation rate-limit counters — backend only (Phase
+    // 5D1/5D2). لا يستطيع أي مستخدم أو Admin قراءتها أو تعديلها من التطبيق —
+    // بلا أي استثناء للأدمن، فلا مسار حقيقي في الكود يحتاج قراءتها من
+    // العميل. الـCloud Functions (analyzeServiceProblem،
+    // translateProviderContent، translateChatMessage) تستخدم Admin SDK حصرًا
+    // (functions/src/index.ts) ولذلك تستطيع الوصول إليها دون أي تأثر بهذه
+    // القاعدة — Security Rules لا تُطبَّق على Admin SDK إطلاقًا.
+    // {document=**} تغطي أي وثيقة/مجموعة فرعية متداخلة أيضًا بشكل صريح، لا
+    // فقط الوثائق المباشرة تحت كل مجموعة.
+    match /ai_rate_limits/{document=**} {
+      allow read, write: if false;
+    }
+    match /translation_rate_limits/{document=**} {
+      allow read, write: if false;
+    }
+
+    // Professional AI Job Assistant rate-limit counters — backend only.
+    // Same unconditional-deny rule as ai_rate_limits/translation_rate_limits
+    // above: no client role, including Admin, may read or write this
+    // collection. Written only by analyzeProfessionalJob via
+    // checkAndConsumeProfessionalAiRateLimit() (functions/src/index.ts)
+    // using the Admin SDK, which is not subject to these Rules at all.
+    match /professional_ai_rate_limits/{document=**} {
+      allow read, write: if false;
+    }
+
+    // Contractor AI Crew & Order Planner rate-limit counters — backend
+    // only. Same unconditional-deny rule as ai_rate_limits/
+    // translation_rate_limits/professional_ai_rate_limits above: no
+    // client role, including Admin, may read or write this collection.
+    // Written only by analyzeContractorJobPlan via
+    // checkAndConsumeContractorAiRateLimit() (functions/src/index.ts)
+    // using the Admin SDK, which is not subject to these Rules at all.
+    match /contractor_ai_rate_limits/{document=**} {
+      allow read, write: if false;
+    }
+
+    // ─── Chat helpers (Phase 4B) ────────────────────────────────────────────
+    // Shared by /conversations/{conversationId} and its nested
+    // /messages/{messageId} match block below — kept at this top level
+    // (rather than nested inside the conversations match, like orders' own
+    // helpers are) specifically so the nested messages match can call them
+    // too; Firestore Rules functions are only visible to the match block
+    // they're declared in and any match blocks nested inside it.
+
+    // ids[0]/ids[1] is always exactly the two-participant pair proven by
+    // Phase 4A (ConversationModel.participantIds) — never a longer list.
+    function otherParticipant(ids, uid) {
+      return ids[0] == uid ? ids[1] : ids[0];
+    }
+
+    function storedUserRole(uid) {
+      return get(/databases/$(database)/documents/users/$(uid)).data.role;
+    }
+
+    // بنية participantIds الحقيقية: قائمة من معرفين مختلفين غير فارغين بالضبط
+    // (مُثبتة في ConversationModel.participantIds — دائمًا شخصان بالضبط).
+    function validParticipantPair(ids) {
+      return ids is list
+        && ids.size() == 2
+        && ids[0] is string && ids[0].size() > 0
+        && ids[1] is string && ids[1].size() > 0
+        && ids[0] != ids[1];
+    }
+
+    // Firestore Rules لا يستطيع فرز(sort) السلاسل النصية — لذلك يُقبل ترتيب
+    // المعرّف الحتمي getConversationId() الحقيقي بأي من الاتجاهين الممكنين
+    // بدل محاولة إعادة تنفيذ الفرز نفسه.
+    function validDeterministicConversationId(convId, ids) {
+      return convId == ids[0] + '_' + ids[1] || convId == ids[1] + '_' + ids[0];
+    }
+
+    // يتحقق أن أحد الطرفين عميل (customer) حقيقي والآخر مزوّد
+    // (professional/contractor) حقيقي — بأي ترتيب — وفقًا لدوريهما المخزّنين
+    // فعليًا في users/، وليس أي دور يدّعيه الطلب.
+    function validCustomerProviderPairing(ids) {
+      return (storedUserRole(ids[0]) == 'customer'
+          && storedUserRole(ids[1]) in ['professional', 'contractor'])
+        || (storedUserRole(ids[1]) == 'customer'
+          && storedUserRole(ids[0]) in ['professional', 'contractor']);
+    }
+
+    // إن كُتب participantRoles، يجب أن يطابق كل مفتاح فيه الدور الحقيقي
+    // المخزّن لصاحبه — يمنع ادّعاء دور مزيّف في هذا الحقل العرضي.
+    function participantRolesMatchStored(ids, roles) {
+      return roles.get(ids[0], null) == storedUserRole(ids[0])
+        && roles.get(ids[1], null) == storedUserRole(ids[1]);
+    }
+
+    // Chat / Conversations — Phase 4B hardening. Real code paths proven in
+    // Phase 4A analysis: lib/features/auth/presentation/providers/
+    // app_providers.dart (getConversationId, currentUserConversationsProvider,
+    // messagesForConversationProvider, sendTextMessageToUser/
+    // sendImageMessageToUser/sendVoiceMessageToUser, sendAdminWarningMessage,
+    // editTextMessageInFirestore, deleteMessageInFirestore,
+    // markConversationAsReadInFirestore, block/unblockConversationInFirestore,
+    // adminBlockConversationInFirestore/adminUnblockConversationInFirestore,
+    // adminHideMessageInFirestore, adminConversationsProvider,
+    // adminMessagesForConversationProvider) and lib/shared/models/models.dart
+    // (ConversationModel, MessageModel).
+    match /conversations/{conversationId} {
+
+      function isParticipant() {
+        return request.auth.uid in resource.data.participantIds;
+      }
+
+      // Phase 4D2: relocated here (from inside the messages match block)
+      // so both the messages and adminWarnings nested subcollections can
+      // share them — a function declared inside one nested match block is
+      // not visible to a sibling nested match block. get() على وثيقة
+      // المحادثة الأصل غير الموجودة يفشل بأمان (يُرفض الطلب) عند محاولة
+      // الوصول لحقولها — بلا حاجة لاستدعاء exists() منفصل أولًا لهذا
+      // الاستخدام (نفس نمط orders.workerBelongsToProvider المثبت في Phase
+      // 3A/3B). فرع أول رسالة في messages فقط هو من يحتاج exists() فعليًا.
+      function parentConversation() {
+        return get(/databases/$(database)/documents/conversations/$(conversationId)).data;
+      }
+
+      function isParentParticipant() {
+        return request.auth.uid in parentConversation().participantIds;
+      }
+
+      // الحقول التي لا يغيّرها أي مسار تحديث حقيقي — يجب أن تبقى ثابتة عبر كل
+      // فروع allow update أدناه (مشاركين، أدمن، أو أي إجراء آخر).
+      function conversationIdentityUnchanged() {
+        return request.resource.data.get('id', conversationId) == conversationId
+          && request.resource.data.participantIds == resource.data.participantIds
+          && request.resource.data.get('participantNames', null)
+            == resource.data.get('participantNames', null)
+          && request.resource.data.get('participantRoles', null)
+            == resource.data.get('participantRoles', null)
+          && request.resource.data.get('createdAt', null)
+            == resource.data.get('createdAt', null);
+      }
+
+      // Hotfix 2: proven via rules_tests that a getAfter()-visible convRef
+      // written twice in the same atomic batch (create, then a separate
+      // update() bumping unreadCount) produces a Rules evaluation error, not
+      // a clean allow/deny — so the real first-message flow now writes
+      // convRef exactly once per batch and must embed the receiver's initial
+      // unread bump directly in the create payload. لذلك أصبح هناك شكلان
+      // مسموحان الآن: بلا unreadCount إطلاقًا (كما كان)، أو صفرًا لكلا
+      // الطرفين (كما كان)، أو — الشكل الحقيقي الجديد لأول رسالة في نفس دفعة
+      // الإنشاء — صفر للمُرسِل (lastMessageSenderId، المُثبَت أصلًا أنه
+      // request.auth.uid) وواحد بالضبط للطرف الآخر، بلا أي تركيبة أخرى.
+      function unreadCountSafeAtCreate(data) {
+        return !('unreadCount' in data)
+          || (
+            data.unreadCount.keys().hasOnly(data.participantIds)
+            && data.unreadCount.get(data.participantIds[0], 0) == 0
+            && data.unreadCount.get(data.participantIds[1], 0) == 0
+          )
+          || (
+            data.unreadCount.keys().hasOnly(data.participantIds)
+            && data.unreadCount.get(data.lastMessageSenderId, 0) == 0
+            && data.unreadCount.get(
+                otherParticipant(data.participantIds, data.lastMessageSenderId), 0) == 1
+          );
+      }
+
+      // الإنشاء: أي طرف موقّع يستطيع إنشاء محادثته الخاصة فقط — بمعرّف وثيقة
+      // حتمي مطابق لأحد ترتيبي participantIds (Firestore Rules لا يستطيع
+      // فرز السلاسل)، بطرفين حقيقيين مختلفين أحدهما موجود فيهما، بأزواج
+      // دور عميل↔مزوّد حقيقية، وبدون أي حقول إشراف/حظر مميّزة.
+      //
+      // ملاحظة توافق مهمة: تدفق أول رسالة الحقيقي (sendTextMessageToUser
+      // وما شابهها) يكتب وثيقة الرسالة أولًا ثم وثيقة المحادثة الأصل بعدها —
+      // وليس ضمن معاملة واحدة ذرية. هذه القاعدة لا تفترض إطلاقًا أن الرسالة
+      // ووثيقة المحادثة تُكتبان معًا؛ هي تتحقق فقط من شكل وثيقة المحادثة
+      // نفسها بمعزل عن ترتيب الكتابة الفعلي.
+      function conversationCreateValid() {
+        return request.resource.data.get('id', conversationId) == conversationId
+          && validParticipantPair(request.resource.data.participantIds)
+          && request.auth.uid in request.resource.data.participantIds
+          && validDeterministicConversationId(
+            conversationId, request.resource.data.participantIds)
+          && validCustomerProviderPairing(request.resource.data.participantIds)
+          && (!('participantRoles' in request.resource.data)
+            || participantRolesMatchStored(
+              request.resource.data.participantIds,
+              request.resource.data.participantRoles))
+          && (!('isBlocked' in request.resource.data)
+            || request.resource.data.isBlocked == false)
+          && unreadCountSafeAtCreate(request.resource.data)
+          && request.resource.data.lastMessage is string
+          && request.resource.data.lastMessageTime is string
+          && request.resource.data.lastMessageSenderId == request.auth.uid
+          && request.resource.data.keys().hasOnly([
+            'id', 'participantIds', 'participantNames', 'participantRoles',
+            'lastMessage', 'lastMessageTime', 'lastMessageSenderId',
+            'unreadCount', 'isBlocked', 'createdAt', 'updatedAt'
+          ]);
+      }
+
+      // آ. تحديث بيانات آخر رسالة (sendTextMessageToUser/sendImageMessageToUser/
+      // sendVoiceMessageToUser عبر set(merge:true)) — أي مشارك، ومرسِل آخر
+      // رسالة يجب أن يكون هو نفسه.
+      function lastMessageBranch(keys) {
+        return isParticipant()
+          && request.resource.data.lastMessageSenderId == request.auth.uid
+          && keys.hasOnly(
+            ['lastMessage', 'lastMessageTime', 'lastMessageSenderId', 'updatedAt']);
+      }
+
+      // ب. زيادة عداد غير المقروء للطرف الآخر فقط بمقدار 1 بالضبط عند
+      // الإرسال — عداد المرسِل نفسه يبقى دون تغيير، وبدون أي معرّف غريب.
+      function unreadIncrementBranch(keys) {
+        return isParticipant()
+          && keys.hasOnly(['unreadCount'])
+          && request.resource.data.unreadCount.keys()
+            .hasOnly(resource.data.participantIds)
+          && request.resource.data.unreadCount.get(
+              otherParticipant(resource.data.participantIds, request.auth.uid), 0)
+            == resource.data.get('unreadCount', {}).get(
+              otherParticipant(resource.data.participantIds, request.auth.uid), 0) + 1
+          && request.resource.data.unreadCount.get(request.auth.uid, 0)
+            == resource.data.get('unreadCount', {}).get(request.auth.uid, 0);
+      }
+
+      // ب-٢. Hotfix 2: نفس شرط unreadIncrementBranch أعلاه بالضبط، لكن في نفس
+      // كتابة تحديث lastMessage (بدلًا من استدعاء update() منفصل ثانٍ على
+      // convRef في الدفعة الذرية نفسها) — مُثبَت عبر rules_tests أن توجيه
+      // كتابتين منفصلتين (set/update أو update/update) لنفس الوثيقة ضمن
+      // دفعة واحدة يُسبّب خطأ تقييم في محرّك القواعد، وليس رفضًا نظيفًا فقط.
+      // الشكل الحقيقي الجديد لـ sendTextMessageToUser/sendImageMessageToUser/
+      // sendVoiceMessageToUser لمحادثة موجودة يكتب الحقلين معًا في نفس
+      // batch.update() الوحيد على convRef.
+      function lastMessageAndUnreadIncrementBranch(keys) {
+        return isParticipant()
+          && request.resource.data.lastMessageSenderId == request.auth.uid
+          && keys.hasOnly([
+            'lastMessage', 'lastMessageTime', 'lastMessageSenderId', 'updatedAt',
+            'unreadCount'
+          ])
+          && request.resource.data.unreadCount.keys()
+            .hasOnly(resource.data.participantIds)
+          && request.resource.data.unreadCount.get(
+              otherParticipant(resource.data.participantIds, request.auth.uid), 0)
+            == resource.data.get('unreadCount', {}).get(
+              otherParticipant(resource.data.participantIds, request.auth.uid), 0) + 1
+          && request.resource.data.unreadCount.get(request.auth.uid, 0)
+            == resource.data.get('unreadCount', {}).get(request.auth.uid, 0);
+      }
+
+      // ج. تصفير عداد غير المقروء الخاص بالقارئ نفسه فقط
+      // (markConversationAsReadInFirestore) — عداد الطرف الآخر يبقى كما هو.
+      function unreadResetBranch(keys) {
+        return isParticipant()
+          && keys.hasOnly(['unreadCount', 'updatedAt'])
+          && request.resource.data.unreadCount.keys()
+            .hasOnly(resource.data.participantIds)
+          && request.resource.data.unreadCount.get(request.auth.uid, 0) == 0
+          && request.resource.data.unreadCount.get(
+              otherParticipant(resource.data.participantIds, request.auth.uid), 0)
+            == resource.data.get('unreadCount', {}).get(
+              otherParticipant(resource.data.participantIds, request.auth.uid), 0);
+      }
+
+      // د. حظر من أحد الطرفين (blockConversationInFirestore) — فقط إن لم تكن
+      // المحادثة محظورة أصلًا، وblockedBy يجب أن يطابق فاعل الحظر نفسه.
+      function participantBlockBranch(keys) {
+        return isParticipant()
+          && resource.data.get('isBlocked', false) == false
+          && request.resource.data.isBlocked == true
+          && request.resource.data.blockedBy == request.auth.uid
+          && keys.hasOnly(['isBlocked', 'blockedBy', 'blockedAt', 'updatedAt']);
+      }
+
+      // هـ. رفع الحظر (unblockConversationInFirestore) — فقط إن كانت المحادثة
+      // محظورة فعلًا، وفقط من الطرف الذي فرض الحظر بنفسه (resource.data.
+      // blockedBy == uid الفاعل) — لا يستطيع الطرف الآخر ولا أي مستخدم رفع
+      // حظر فرضه غيره، ولا رفع حظر فرضه الأدمن (blockedBy عندها = uid
+      // الأدمن، وليس أيًا من الطرفين).
+      function participantUnblockBranch(keys) {
+        return isParticipant()
+          && resource.data.get('isBlocked', false) == true
+          && resource.data.get('blockedBy', null) == request.auth.uid
+          && request.resource.data.isBlocked == false
+          && request.resource.data.unblockedBy == request.auth.uid
+          && keys.hasOnly(['isBlocked', 'unblockedBy', 'unblockedAt', 'updatedAt']);
+      }
+
+      // و. حظر الأدمن (adminBlockConversationInFirestore) — بالحقول الحقيقية
+      // فقط، وblockedBy يجب أن يطابق الأدمن الفاعل نفسه.
+      function adminBlockBranch(keys) {
+        return isAdmin()
+          && request.resource.data.isBlocked == true
+          && request.resource.data.blockedByRole == 'admin'
+          && request.resource.data.blockedBy == request.auth.uid
+          && keys.hasOnly([
+            'isBlocked', 'blockedBy', 'blockedByName', 'blockedByRole',
+            'blockedAt', 'blockReason', 'updatedAt'
+          ]);
+      }
+
+      // ز. رفع حظر الأدمن (adminUnblockConversationInFirestore) — بالحقول
+      // الحقيقية فقط، وunblockedBy يجب أن يطابق الأدمن الفاعل نفسه. لا قيد
+      // على من فرض الحظر أصلًا — الأدمن يستطيع رفع أي حظر (مطابق للسلوك
+      // الحقيقي غير المقيَّد في adminUnblockConversationInFirestore).
+      function adminUnblockBranch(keys) {
+        return isAdmin()
+          && request.resource.data.isBlocked == false
+          && request.resource.data.unblockedByRole == 'admin'
+          && request.resource.data.unblockedBy == request.auth.uid
+          && keys.hasOnly([
+            'isBlocked', 'unblockedBy', 'unblockedByName', 'unblockedByRole',
+            'unblockedAt', 'updatedAt'
+          ]);
+      }
+
+      function conversationUpdateAllowed(keys) {
+        return lastMessageBranch(keys)
+          || unreadIncrementBranch(keys)
+          || lastMessageAndUnreadIncrementBranch(keys)
+          || unreadResetBranch(keys)
+          || participantBlockBranch(keys)
+          || participantUnblockBranch(keys)
+          || adminBlockBranch(keys)
+          || adminUnblockBranch(keys);
+      }
+
+      // القراءة: أحد الطرفين المشاركين فقط، أو الأدمن (قراءة غير مُصفّاة
+      // لكل المحادثات — adminConversationsProvider). يدعم كلا الاستعلامين
+      // الحقيقيين: where('participantIds', arrayContains: uid) للطرفين،
+      // و.collection('conversations').snapshots() بلا أي فلتر للأدمن.
+      allow read: if request.auth != null
+        && (isParticipant() || isAdmin());
+
+      allow create: if request.auth != null
+        && conversationCreateValid();
+
+      // ملاحظة أداء: نفس النمط المثبت في orders (Phase 3B2) — عبارة allow
+      // update واحدة فقط، تحسب diff().affectedKeys() مرة واحدة وتمرّرها
+      // (`keys`) عبر كل الدوال أعلاه بدل إعادة حسابها في كل فرع.
+      allow update: if request.auth != null
+        && conversationIdentityUnchanged()
+        && conversationUpdateAllowed(
+          request.resource.data.diff(resource.data).affectedKeys());
+
+      // لا يوجد مسار حذف فعلي للمحادثات في التطبيق.
+      allow delete: if false;
+
+      // Messages — Phase 4B hardening.
+      match /messages/{messageId} {
+
+        // get() على وثيقة المحادثة الأصل غير الموجودة يفشل بأمان (يُرفض
+        // الطلب) عند محاولة الوصول لحقولها — بلا حاجة لاستدعاء exists()
+        // منفصل أولًا. (parentConversation()/isParentParticipant() moved up
+        // to the parent conversations/{conversationId} match block in Phase
+        // 4D2 so the sibling adminWarnings subcollection can reuse them
+        // too — both remain get()-based and are used only by allow read
+        // below, which is never part of a write batch.)
+
+        // Phase 4E: sendTextMessageToUser/sendImageMessageToUser/
+        // sendVoiceMessageToUser now write the first message and its parent
+        // conversation document together in one atomic Firestore
+        // WriteBatch, so a message can no longer legitimately exist without
+        // its parent conversation — the old firstMessageCreateAllowed()
+        // "missing parent" branch has been removed entirely. But a plain
+        // get() on the conversation, evaluated for the message-create
+        // operation within that same batch, would still see the
+        // pre-transaction ("before") state — i.e. not yet existing — since
+        // get() never reflects sibling writes in the same atomic commit.
+        // getAfter() is what Firestore Rules provides specifically for
+        // this: it resolves to the conversation's state after every write
+        // in the current batch/transaction is applied, so the
+        // just-created-in-this-same-batch conversation (with its real
+        // participantIds/isBlocked) is visible here. For an existing
+        // conversation (no conversation write in this batch, or an
+        // unrelated merge that doesn't change participantIds/isBlocked),
+        // getAfter() resolves to the same value get() would have — so this
+        // is safe for both the first-message and every-later-message case.
+        function parentConversationAfter() {
+          return getAfter(/databases/$(database)/documents/conversations/$(conversationId)).data;
+        }
+
+        // شكل الإنشاء الحقيقي المشترك بين الرسائل العادية (نص/صورة/صوت) وأول
+        // رسالة — مفاتيح مختلفة فعليًا بحسب النوع (نص: بدون حقول وسائط،
+        // صورة: imageUrl/mediaUrl/storagePath/fileName، صوت: voiceUrl/
+        // audioUrl/mediaUrl/storagePath/fileName/voiceDurationSec) — مطابقة
+        // لخرائط sendTextMessageToUser/sendImageMessageToUser/
+        // sendVoiceMessageToUser الحقيقية بالضبط.
+        function validMessageCreateShape(data) {
+          return data.get('id', messageId) == messageId
+            && data.get('conversationId', conversationId) == conversationId
+            && data.type in ['text', 'image', 'voice']
+            && data.get('isRead', false) == false
+            && data.get('isEdited', false) == false
+            && data.get('isDeleted', false) == false
+            && data.text is string
+            && data.sentAt is string
+            && (
+              data.type == 'text'
+                ? data.keys().hasOnly([
+                  'id', 'conversationId', 'senderId', 'receiverId', 'text',
+                  'type', 'sentAt', 'isRead', 'isEdited', 'isDeleted'
+                ])
+                : data.type == 'image'
+                  ? data.keys().hasOnly([
+                    'id', 'conversationId', 'senderId', 'receiverId', 'text',
+                    'type', 'imageUrl', 'mediaUrl', 'storagePath', 'fileName',
+                    'sentAt', 'isRead', 'isEdited', 'isDeleted'
+                  ])
+                  : data.keys().hasOnly([
+                    'id', 'conversationId', 'senderId', 'receiverId', 'text',
+                    'type', 'voiceUrl', 'audioUrl', 'mediaUrl', 'storagePath',
+                    'fileName', 'voiceDurationSec', 'sentAt', 'isRead',
+                    'isEdited', 'isDeleted'
+                  ])
+            );
+        }
+
+        // كل إنشاء رسالة عادية (أول رسالة أو لاحقة على السواء): المرسِل يجب
+        // أن يكون هو نفسه المستخدم الموقّع، وأحد طرفي المحادثة الأصل تحديدًا
+        // (يُتحقق من حالتها بعد تطبيق كل كتابات هذه الدفعة الذرية عبر
+        // getAfter()، وليس قبلها)، وreceiverId يجب أن يكون الطرف الآخر
+        // بالضبط (لا يمكن انتحال طرف ثالث)، وأن لا تكون المحادثة محظورة.
+        function normalMessageCreateAllowed() {
+          return request.auth.uid in parentConversationAfter().participantIds
+            && request.resource.data.senderId == request.auth.uid
+            && request.resource.data.receiverId
+              == otherParticipant(parentConversationAfter().participantIds, request.auth.uid)
+            && parentConversationAfter().get('isBlocked', false) != true
+            && validMessageCreateShape(request.resource.data);
+        }
+
+        // Phase 4D2: adminWarning creation is no longer permitted inside
+        // messages at all — new warnings are written exclusively to the
+        // sibling adminWarnings subcollection below, so every participant
+        // reader of messages can be proven to only ever see normal message
+        // types (see isNormalMessageType()/allow read below). Legacy
+        // type=='adminWarning' documents that already exist here from
+        // before this phase remain physically in place (no migration, no
+        // deletion — Phase 4D1/6b decision) but are governed only by
+        // adminHideBranch (Admin hide) below; no create path can ever
+        // produce a new one here again, for anyone, Admin included.
+
+        // فقط الأنواع العادية (نص/صورة/صوت) — الإنذارات الجديدة تُكتب حصرًا
+        // في adminWarnings الآن، والوثائق القديمة type=='adminWarning' التي
+        // بقيت هنا من قبل هذه المرحلة (بدون ترحيل أو حذف) ليست من هذه الأنواع
+        // فتُستبعد تلقائيًا من قراءة المشاركين أدناه.
+        function isNormalMessageType() {
+          return resource.data.type in ['text', 'image', 'voice'];
+        }
+
+        // الحقول التي لا يغيّرها أي مسار تحديث حقيقي للرسالة — تبقى ثابتة عبر
+        // كل فروع allow update أدناه (تعديل/حذف/قراءة/إشراف).
+        function messageIdentityUnchanged() {
+          return request.resource.data.get('id', messageId) == messageId
+            && request.resource.data.get('conversationId', conversationId) == conversationId
+            && request.resource.data.senderId == resource.data.senderId
+            && request.resource.data.receiverId == resource.data.receiverId
+            && request.resource.data.sentAt == resource.data.sentAt
+            && request.resource.data.type == resource.data.type
+            && request.resource.data.get('imageUrl', null) == resource.data.get('imageUrl', null)
+            && request.resource.data.get('mediaUrl', null) == resource.data.get('mediaUrl', null)
+            && request.resource.data.get('storagePath', null) == resource.data.get('storagePath', null)
+            && request.resource.data.get('fileName', null) == resource.data.get('fileName', null)
+            && request.resource.data.get('voiceUrl', null) == resource.data.get('voiceUrl', null)
+            && request.resource.data.get('audioUrl', null) == resource.data.get('audioUrl', null)
+            && request.resource.data.get('voiceDurationSec', null)
+              == resource.data.get('voiceDurationSec', null)
+            && request.resource.data.get('targetUserIds', null)
+              == resource.data.get('targetUserIds', null);
+        }
+
+        // آ. تعديل المرسِل لرسالته النصية الخاصة (editTextMessageInFirestore)
+        // — فقط رسالة نصية غير محذوفة يملكها فعلًا.
+        function senderEditBranch(keys) {
+          return resource.data.senderId == request.auth.uid
+            && resource.data.type == 'text'
+            && resource.data.get('isDeleted', false) == false
+            && request.resource.data.isEdited == true
+            && keys.hasOnly(['text', 'isEdited', 'editedAt']);
+        }
+
+        // ب. حذف المرسِل الناعم لرسالته الخاصة (deleteMessageInFirestore) —
+        // فقط إن لم تكن محذوفة أصلًا (يمنع إعادة كتابة deletedBy فوق حذف
+        // إداري سابق: adminDeleted/deletedByRole تبقيان كما هما لأنهما ليستا
+        // ضمن المفاتيح المسموحة هنا أصلًا).
+        function senderDeleteBranch(keys) {
+          return resource.data.senderId == request.auth.uid
+            && resource.data.get('isDeleted', false) == false
+            && request.resource.data.isDeleted == true
+            && request.resource.data.text == ''
+            && request.resource.data.deletedBy == request.auth.uid
+            && keys.hasOnly(['isDeleted', 'text', 'deletedBy', 'deletedAt']);
+        }
+
+        // ج. تعليم القارئ كمقروءة (markConversationAsReadInFirestore) —
+        // المستلم الحقيقي فقط، وفقط false/غائب → true.
+        function receiverMarkReadBranch(keys) {
+          return resource.data.receiverId == request.auth.uid
+            && resource.data.get('isRead', false) == false
+            && request.resource.data.isRead == true
+            && keys.hasOnly(['isRead']);
+        }
+
+        // د. إخفاء الأدمن (adminHideMessageInFirestore) — بالحقول الحقيقية
+        // فقط. لا يوجد فرع "إظهار مجددًا" لأن لا مسار حقيقي له في التطبيق.
+        function adminHideBranch(keys) {
+          return isAdmin()
+            && request.resource.data.isDeleted == true
+            && request.resource.data.text == ''
+            && request.resource.data.deletedBy == request.auth.uid
+            && request.resource.data.deletedByRole == 'admin'
+            && request.resource.data.adminDeleted == true
+            && keys.hasOnly([
+              'isDeleted', 'deletedAt', 'deletedBy', 'deletedByName',
+              'deletedByRole', 'adminDeleted', 'text'
+            ]);
+        }
+
+        function messageUpdateAllowed(keys) {
+          return senderEditBranch(keys)
+            || senderDeleteBranch(keys)
+            || receiverMarkReadBranch(keys)
+            || adminHideBranch(keys);
+        }
+
+        // القراءة: الأدمن يقرأ كل الرسائل بلا فلترة (adminMessagesForConversationProvider —
+        // بما فيها وثائق type=='adminWarning' القديمة المتبقية هنا من قبل
+        // Phase 4D2). أحد طرفي المحادثة الأصل يقرأ فقط الأنواع العادية
+        // (نص/صورة/صوت) — الاستعلام الحقيقي الجديد
+        // where('type', 'in', ['text','image','voice']) يضمن لـ Firestore
+        // إثبات أن كل وثيقة مُعادة تحقق isNormalMessageType()، فلا يستطيع أي
+        // طرف قراءة إنذار أدمن (جديد أو قديم) من هذا المسار إطلاقًا — حتى عبر
+        // get() مباشر على معرف وثيقة محدد.
+        allow read: if request.auth != null
+          && (
+            isAdmin()
+            || (isParentParticipant() && isNormalMessageType())
+          );
+
+        // الإنشاء: رسالة عادية (نص/صورة/صوت) فقط — لا مسار إنشاء إنذار أدمن
+        // هنا بعد الآن لأي فاعل، بما فيه الأدمن نفسه (انظر sendAdminWarningMessage
+        // الجديدة التي تكتب في conversations/{id}/adminWarnings/{id} فقط).
+        allow create: if request.auth != null && normalMessageCreateAllowed();
+
+        allow update: if request.auth != null
+          && messageIdentityUnchanged()
+          && messageUpdateAllowed(
+            request.resource.data.diff(resource.data).affectedKeys());
+
+        // لا يوجد حذف فعلي لوثيقة الرسالة — الحذف دائمًا حذف ناعم
+        // (isDeleted) عبر allow update أعلاه.
+        allow delete: if false;
+      }
+
+      // Admin Warnings — Phase 4D2. Real code path proven in Phase 4D1/4D2
+      // analysis: sendAdminWarningMessage now writes exclusively here
+      // (lib/features/auth/presentation/providers/app_providers.dart),
+      // instead of into messages, so that the targeted-only-visibility
+      // guarantee can actually be proven by Firestore Rules — a single
+      // unfiltered messages query could never serve both "every participant
+      // sees normal messages" and "only targetUserIds sees a warning"
+      // simultaneously (Firestore Rules are not post-query filters; a list
+      // request is denied outright unless every document it could return is
+      // provably readable). Legacy type=='adminWarning' documents already
+      // sitting inside messages from before this phase are intentionally
+      // NOT migrated here (Phase 4D1 6b decision) — they remain Admin-only
+      // readable in place via messages' existing adminHideBranch/isAdmin()
+      // read branch.
+      match /adminWarnings/{warningId} {
+
+        function isTargeted() {
+          return request.auth.uid in resource.data.targetUserIds;
+        }
+
+        // الحقول التي لا يغيّرها أي مسار تحديث حقيقي — تبقى ثابتة عبر فرع
+        // الإخفاء الوحيد أدناه.
+        function adminWarningIdentityUnchanged() {
+          return request.resource.data.get('id', warningId) == warningId
+            && request.resource.data.conversationId == resource.data.conversationId
+            && request.resource.data.senderId == resource.data.senderId
+            && request.resource.data.receiverId == resource.data.receiverId
+            && request.resource.data.targetUserIds == resource.data.targetUserIds
+            && request.resource.data.sentAt == resource.data.sentAt
+            && request.resource.data.type == resource.data.type;
+        }
+
+        // الإنشاء: الأدمن فقط (isAdmin() يتحقق أصلًا أن الدور المخزّن
+        // الحقيقي للفاعل هو admin)، لمحادثة أصل موجودة فعلًا (parentConversation()
+        // يفشل بأمان إن لم توجد)، وsenderId يطابق الأدمن الفاعل نفسه.
+        // targetUserIds قائمة من 1 أو 2 معرّف مشارك حقيقي مختلفين ينتميان
+        // فعلًا لطرفي تلك المحادثة — يدعم كلا مساري الإرسال الحقيقيين
+        // ("طرف واحد" أو "كلا الطرفين"). لا فحص isBlocked إطلاقًا — الإنذار
+        // يتجاوز حظر المحادثة عمدًا (نفس سلوك التطبيق الحقيقي).
+        function adminWarningCreateValid() {
+          return isAdmin()
+            && request.resource.data.senderId == request.auth.uid
+            && request.resource.data.get('id', warningId) == warningId
+            && request.resource.data.get('conversationId', conversationId) == conversationId
+            && request.resource.data.receiverId == ''
+            && request.resource.data.type == 'adminWarning'
+            && request.resource.data.text is string
+            && request.resource.data.text.size() > 0
+            && request.resource.data.sentAt is string
+            && request.resource.data.targetUserIds is list
+            && request.resource.data.targetUserIds.size() >= 1
+            && request.resource.data.targetUserIds.size() <= 2
+            && (request.resource.data.targetUserIds.size() < 2
+              || request.resource.data.targetUserIds[0]
+                != request.resource.data.targetUserIds[1])
+            && request.resource.data.targetUserIds.hasOnly(parentConversation().participantIds)
+            && request.resource.data.get('isRead', false) == false
+            && request.resource.data.get('isEdited', false) == false
+            && request.resource.data.get('isDeleted', false) == false
+            && request.resource.data.keys().hasOnly([
+              'id', 'conversationId', 'senderId', 'receiverId', 'text', 'type',
+              'targetUserIds', 'sentAt', 'isRead', 'isEdited', 'isDeleted'
+            ]);
+        }
+
+        // التعديل: إخفاء الأدمن فقط (adminHideMessageInFirestore/ما يعادلها
+        // للمجموعة الجديدة) — بالحقول الحقيقية فقط. لا فرع تعديل/حذف/تعليم
+        // قراءة لأي مشارك (لا مسار حقيقي لذلك)، ولا "إظهار مجددًا" للأدمن.
+        function adminWarningHideBranch(keys) {
+          return isAdmin()
+            && request.resource.data.isDeleted == true
+            && request.resource.data.text == ''
+            && request.resource.data.deletedBy == request.auth.uid
+            && request.resource.data.deletedByRole == 'admin'
+            && request.resource.data.adminDeleted == true
+            && keys.hasOnly([
+              'isDeleted', 'deletedAt', 'deletedBy', 'deletedByName',
+              'deletedByRole', 'adminDeleted', 'text'
+            ]);
+        }
+
+        // القراءة: الأدمن يقرأ كل الإنذارات بلا فلترة، أو المشارك المُستهدَف
+        // تحديدًا (uid ضمن targetUserIds) وطالما لا يزال أحد طرفي المحادثة
+        // الأصل. الطرف غير المُستهدَف يُرفض دائمًا — سواء بقراءة مباشرة
+        // بمعرف الوثيقة أو باستعلام غير مُصفّى.
+        allow read: if request.auth != null
+          && (isAdmin() || (isParentParticipant() && isTargeted()));
+
+        allow create: if request.auth != null && adminWarningCreateValid();
+
+        allow update: if request.auth != null
+          && adminWarningIdentityUnchanged()
+          && adminWarningHideBranch(
+            request.resource.data.diff(resource.data).affectedKeys());
+
+        // لا يوجد حذف فعلي — الإخفاء دائمًا حذف ناعم عبر allow update أعلاه.
+        allow delete: if false;
+      }
+    }
+
+  }
+}

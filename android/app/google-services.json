@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "655309300629",
+    "project_id": "san3a-app-4d4fc",
+    "storage_bucket": "san3a-app-4d4fc.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:655309300629:android:eeff4e2d727912f00e0c9c",
+        "android_client_info": {
+          "package_name": "com.example.san3a"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBMES1xEjSf-Vxo5JqMymmmVMHHDI7Su8E"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
