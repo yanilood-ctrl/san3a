@@ -50,3 +50,4 @@ rules_backups/
 *.jks
 *.keystore
 *service-account*.json
+.secret.local
